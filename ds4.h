@@ -327,6 +327,7 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size);
 void ds4_session_free(ds4_session *s);
+const char *ds4_session_spec_suffix(const ds4_session *s);
 int ds4_session_power(ds4_session *s);
 int ds4_session_set_power(ds4_session *s, int power_percent);
 bool ds4_session_is_distributed(ds4_session *s);
