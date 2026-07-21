@@ -64127,6 +64127,28 @@ static int ds4_session_eval_dist_dspark_speculative_argmax(
         if (errlen) snprintf(err, errlen, "distributed decode requires a valid checkpoint");
         return -1;
     }
+    static int spec_log = -1;
+    if (spec_log < 0) spec_log = getenv("DS4_DSPARK_SPEC_LOG") != NULL ? 1 : 0;
+    static uint64_t log_cycles, log_proposed, log_committed,
+                    log_full, log_partial, log_miss, log_nodraft;
+#define DIST_SPEC_LOG(kind, dn, commit) do {                                  \
+        if (spec_log) {                                                        \
+            log_cycles++;                                                      \
+            log_proposed += (uint64_t)(dn);                                    \
+            log_committed += (uint64_t)(commit);                               \
+            fprintf(stderr,                                                    \
+                    "ds4: dist spec: cycle=%llu %s draft=%d commit=%d "        \
+                    "accept_rate=%.1f%% full=%llu partial=%llu miss=%llu "     \
+                    "nodraft=%llu\n",                                          \
+                    (unsigned long long)log_cycles, (kind), (dn), (commit),    \
+                    log_proposed ? 100.0 * (double)log_committed /             \
+                                   (double)log_proposed : 0.0,                 \
+                    (unsigned long long)log_full,                              \
+                    (unsigned long long)log_partial,                           \
+                    (unsigned long long)log_miss,                              \
+                    (unsigned long long)log_nodraft);                          \
+        }                                                                      \
+    } while (0)
     int n_accept = 0;
 
     /* Commit the first token; the final-hop worker attaches its draft
@@ -64138,6 +64160,7 @@ static int ds4_session_eval_dist_dspark_speculative_argmax(
                                         1,
                                         (uint32_t)s->checkpoint.len,
                                         false,
+                                        false,
                                         s->logits,
                                         &spec,
                                         err,
@@ -64147,6 +64170,10 @@ static int ds4_session_eval_dist_dspark_speculative_argmax(
     accepted[n_accept++] = first_token;
     if (first_token == eos_token || n_accept >= max_tokens ||
         spec.draft_len == 0) {
+        if (spec.draft_len == 0) {
+            log_nodraft++;
+            DIST_SPEC_LOG("nodraft", 0, 0);
+        }
         return n_accept;
     }
 
@@ -64163,7 +64190,11 @@ static int ds4_session_eval_dist_dspark_speculative_argmax(
         if (drafts[i] < 0 || drafts[i] >= (int)DS4_N_VOCAB) return n_accept;
     }
     const int target_top = sample_argmax(s->logits, DS4_N_VOCAB);
-    if (target_top != drafts[0]) return n_accept;
+    if (target_top != drafts[0]) {
+        log_miss++;
+        DIST_SPEC_LOG("miss", draft_n, 0);
+        return n_accept;
+    }
     if (drafts[0] == eos_token) draft_n = 1;
 
     const uint32_t start = (uint32_t)s->checkpoint.len;
@@ -64183,6 +64214,7 @@ static int ds4_session_eval_dist_dspark_speculative_argmax(
                                         (uint32_t)draft_n,
                                         start,
                                         true,
+                                        false,
                                         row_logits,
                                         &vspec,
                                         err,
@@ -64209,6 +64241,8 @@ static int ds4_session_eval_dist_dspark_speculative_argmax(
             accepted[n_accept++] = drafts[i];
             if (drafts[i] == eos_token) break;
         }
+        log_full++;
+        DIST_SPEC_LOG("full", draft_n, commit);
         ds4_dist_session_spec_resolve(s->distributed, true);
         ds4_session_spec_frontier_free(frontier);
         free(row_logits);
@@ -64218,6 +64252,8 @@ static int ds4_session_eval_dist_dspark_speculative_argmax(
     /* Partial accept: roll both nodes back to the pre-verify frontier, then
      * replay the accepted tokens through exact decode. The first replay
      * frame carries the ROLLBACK action to the worker. */
+    log_partial++;
+    DIST_SPEC_LOG("partial", draft_n, commit);
     ds4_dist_session_spec_resolve(s->distributed, false);
     const int rollback_rc = ds4_session_spec_rollback(s, frontier, start, err, errlen);
     ds4_session_spec_frontier_free(frontier);
@@ -64232,6 +64268,7 @@ static int ds4_session_eval_dist_dspark_speculative_argmax(
                                             1,
                                             (uint32_t)s->checkpoint.len,
                                             false,
+                                            true,
                                             s->logits,
                                             &rspec,
                                             err,

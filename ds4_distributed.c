@@ -59,10 +59,13 @@
 /* The span is a speculative-verify pass: the final hop returns per-row
  * argmax plus last-row logits instead of a single logits vector. */
 #define DS4_DIST_WORK_F_SPEC_VERIFY 0x00000010u
+/* Skip the draft preparation on this frame (replay frames after a partial
+ * accept: their proposals would be discarded by the coordinator anyway). */
+#define DS4_DIST_WORK_F_NO_DRAFT 0x00000020u
 #define DS4_DIST_WORK_F_VALID_MASK \
     (DS4_DIST_WORK_F_INPUT_HC | DS4_DIST_WORK_F_OUTPUT_LOGITS | \
      DS4_DIST_WORK_F_RESET_SESSION | DS4_DIST_WORK_F_ACK_ONLY | \
-     DS4_DIST_WORK_F_SPEC_VERIFY)
+     DS4_DIST_WORK_F_SPEC_VERIFY | DS4_DIST_WORK_F_NO_DRAFT)
 #define DS4_DIST_RESULT_ACK 0u
 #define DS4_DIST_RESULT_HIDDEN_STATE 1u
 #define DS4_DIST_RESULT_LOGITS 2u
@@ -2540,6 +2543,7 @@ static int dist_coordinator_send_remote_work_on_fd(
         bool reset_session,
         bool ack_only,
         bool spec_verify,
+        bool no_draft,
         uint32_t spec_action,
         const float *hidden_hc,
         uint32_t hidden_hc_bytes,
@@ -2566,6 +2570,7 @@ static int dist_coordinator_send_remote_work_on_fd(
     if (reset_session) work.flags |= DS4_DIST_WORK_F_RESET_SESSION;
     if (ack_only) work.flags |= DS4_DIST_WORK_F_ACK_ONLY;
     if (spec_verify) work.flags |= DS4_DIST_WORK_F_SPEC_VERIFY;
+    if (no_draft) work.flags |= DS4_DIST_WORK_F_NO_DRAFT;
     work.spec_action = spec_action;
     if ((first->flags & DS4_DIST_ROUTE_F_OUTPUT_LOGITS) != 0) {
         work.flags |= DS4_DIST_WORK_F_OUTPUT_LOGITS;
@@ -2605,6 +2610,7 @@ static int dist_coordinator_eval_remote_on_fd(
         uint64_t expected_result_hash,
         bool reset_session,
         bool spec_verify,
+        bool no_draft,
         uint32_t spec_action,
         const float *hidden_hc,
         uint32_t hidden_hc_bytes,
@@ -2628,6 +2634,7 @@ static int dist_coordinator_eval_remote_on_fd(
                                                      reset_session,
                                                      false,
                                                      spec_verify,
+                                                     no_draft,
                                                      spec_action,
                                                      hidden_hc,
                                                      hidden_hc_bytes,
@@ -2758,6 +2765,7 @@ static int dist_coordinator_eval_span_spec(
         uint64_t request_id,
         bool reset_session,
         bool spec_verify,
+        bool no_draft,
         uint32_t spec_action,
         float *logits,
         ds4_dist_spec_result *spec,
@@ -2842,6 +2850,7 @@ static int dist_coordinator_eval_span_spec(
                                                 result_hash,
                                                 reset_session,
                                                 spec_verify,
+                                                no_draft,
                                                 spec_action,
                                                 hidden,
                                                 hidden_bytes,
@@ -2891,6 +2900,7 @@ static int dist_coordinator_eval_span(
                                            session_id,
                                            request_id,
                                            reset_session,
+                                           false,
                                            false,
                                            DS4_DIST_SPEC_ACTION_NONE,
                                            logits,
@@ -3347,6 +3357,7 @@ static void *dist_prefill_sender_main(void *arg) {
                                                          slot->result_hash,
                                                          slot->reset_session,
                                                          slot->ack_only,
+                                                         false,
                                                          false,
                                                          DS4_DIST_SPEC_ACTION_NONE,
                                                          slot->hidden,
@@ -5836,6 +5847,7 @@ int ds4_dist_session_eval_spec_span(
         uint32_t n_tokens,
         uint32_t pos0,
         bool spec_verify,
+        bool no_draft,
         float *logits,
         ds4_dist_spec_result *spec,
         char *err,
@@ -5858,6 +5870,7 @@ int ds4_dist_session_eval_spec_span(
                                            d->request_id++,
                                            false,
                                            spec_verify,
+                                           no_draft,
                                            action,
                                            logits,
                                            spec,
@@ -7760,8 +7773,11 @@ static int dist_worker_process_work_payload(
         session->token_hash_valid = true;
         /* DSpark: the final-hop worker owns the target layers, so prepare the
          * draft locally right after the committed token's slice eval. The
-         * proposal rides back on the RESULT frame as DS4_DIST_RESULT_LOGITS_SPEC. */
-        if (local_output_logits && work.n_tokens == 1) {
+         * proposal rides back on the RESULT frame as DS4_DIST_RESULT_LOGITS_SPEC.
+         * Replay frames (F_NO_DRAFT) skip this: the coordinator discards
+         * their proposals. */
+        if (local_output_logits && work.n_tokens == 1 &&
+            (work.flags & DS4_DIST_WORK_F_NO_DRAFT) == 0) {
             spec_draft_len =
                 ds4_session_dspark_prepare_draft(session->session,
                                                  tokens[0],

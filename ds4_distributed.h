@@ -114,6 +114,7 @@ int ds4_dist_session_eval_spec_span(
         uint32_t n_tokens,
         uint32_t pos0,
         bool spec_verify,
+        bool no_draft,
         float *logits,
         ds4_dist_spec_result *spec,
         char *err,
