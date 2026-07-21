@@ -100,6 +100,26 @@ int ds4_dist_session_eval(
         char *err,
         size_t errlen);
 
+/* Distributed DSpark speculation. The block size is non-zero only when the
+ * route's final hop owns the output head and advertised a DSpark draft.
+ * ds4_dist_session_eval_spec_span evaluates a token span (a plain decode when
+ * spec_verify is false, a speculative verify when true) and unpacks the
+ * speculative result payload into spec. ds4_dist_session_spec_resolve queues
+ * the KEEP/ROLLBACK commit that the next sent frame carries to the worker. */
+uint32_t ds4_dist_session_spec_block_size(ds4_dist_session *d);
+int ds4_dist_session_eval_spec_span(
+        ds4_dist_session *d,
+        ds4_session *owner,
+        const int *tokens,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        bool spec_verify,
+        float *logits,
+        ds4_dist_spec_result *spec,
+        char *err,
+        size_t errlen);
+void ds4_dist_session_spec_resolve(ds4_dist_session *d, bool keep);
+
 /* Save/load use the normal DSV4 payload format. The coordinator gathers or
  * pushes remote layer shards internally so saved files are topology-neutral.
  */

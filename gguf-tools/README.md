@@ -154,6 +154,11 @@ defaults match the published Flash DSpark config: block size 5, target layers
 `--dspark-block-size`, `--dspark-target-layers`, `--dspark-markov-rank`, and
 `--dspark-noise-token-id` if converting a different checkpoint.
 
+The same support GGUF works for distributed inference: pass it via `--mtp` on
+the final-hop worker (the node with `--layers N:output` covering the target
+layers), never on the coordinator. See "Distributed DSpark Speculative
+Decoding" in the top-level README.
+
 Before a full write, regenerate one support tensor and record its checksum:
 
 ```sh

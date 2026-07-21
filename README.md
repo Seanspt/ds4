@@ -488,6 +488,52 @@ slow or metered links, `--layers 20:42` is also supported: the coordinator will
 load the output head and compute logits locally, trading extra coordinator work
 for smaller per-token replies.
 
+### Distributed DSpark Speculative Decoding
+
+DSpark (see the `--mtp`/`--dspark` section above) also works in distributed
+mode. The draft model must live on the **final-hop worker** — the node that
+owns the output head and the DSpark target layers (40..42 for Flash) — while
+the coordinator keeps layers 0..K and drives sampling and accept/reject. The
+worker captures the target layers' hidden states locally during its slice
+forward, prepares drafts in place, and piggybacks proposals on its logits
+replies; verification is one multi-token span that returns per-row argmax
+plus the last-row logits.
+
+```sh
+# Machine A (e.g. Mac Studio): coordinator, layers 0..37. --dspark enables
+# the speculative loop; no support model is loaded here.
+./ds4 \
+  -m gguf/DeepSeek-V4-Flash-Q4K.gguf \
+  --role coordinator \
+  --layers 0:37 \
+  --listen 169.254.43.68 1234 \
+  --dspark --temp 0
+
+# Machine B (e.g. RTX 5090): worker, layers 38..output plus the DSpark
+# support model. Its model GGUF must contain token_embd (the full model
+# file works: only the needed spans are mapped).
+./ds4 \
+  -m gguf/DeepSeek-V4-Flash-Q4K.gguf \
+  --role worker \
+  --layers 38:output \
+  --coordinator 169.254.43.68 1234 \
+  --mtp gguf/DeepSeek-V4-Flash-DSpark-support.gguf \
+  --dspark
+```
+
+Constraints:
+
+- Both sides need `--dspark`; only the worker gets `--mtp`.
+- The worker's slice must end at the final layer and own the output head
+  (`N:output`), and all DSpark target layers must be inside its slice.
+- The worker maps the main model's `token_embd` in addition to its slice
+  (the draft embeds its block through it), so its GGUF must carry that
+  tensor — use the full model file or a split that includes it.
+- Legacy MTP (`DS4_SUPPORT_MTP_LEGACY`) support models are refused in
+  distributed mode; only DSpark is supported.
+- `--dspark-strict`/`--quality` keep target-only decoding, as in single-node
+  mode; `DS4_MTP_SPEC_DISABLE=1` disables speculation on the coordinator.
+
 ### Network Link Comparison
 
 The table below shows the same two M5 Max hosts, the same 91 GB Flash quant,

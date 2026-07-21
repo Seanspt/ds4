@@ -56,12 +56,26 @@
 #define DS4_DIST_WORK_F_OUTPUT_LOGITS 0x00000002u
 #define DS4_DIST_WORK_F_RESET_SESSION 0x00000004u
 #define DS4_DIST_WORK_F_ACK_ONLY 0x00000008u
+/* The span is a speculative-verify pass: the final hop returns per-row
+ * argmax plus last-row logits instead of a single logits vector. */
+#define DS4_DIST_WORK_F_SPEC_VERIFY 0x00000010u
 #define DS4_DIST_WORK_F_VALID_MASK \
     (DS4_DIST_WORK_F_INPUT_HC | DS4_DIST_WORK_F_OUTPUT_LOGITS | \
-     DS4_DIST_WORK_F_RESET_SESSION | DS4_DIST_WORK_F_ACK_ONLY)
+     DS4_DIST_WORK_F_RESET_SESSION | DS4_DIST_WORK_F_ACK_ONLY | \
+     DS4_DIST_WORK_F_SPEC_VERIFY)
 #define DS4_DIST_RESULT_ACK 0u
 #define DS4_DIST_RESULT_HIDDEN_STATE 1u
 #define DS4_DIST_RESULT_LOGITS 2u
+/* LOGITS with a DSpark draft proposal prepended:
+ * u32 draft_len, draft_len x u32 token ids, vocab x f32 logits. */
+#define DS4_DIST_RESULT_LOGITS_SPEC 3u
+/* Speculative verify result:
+ * u32 n_rows, n_rows x i32 row argmax, vocab x f32 last-row logits. */
+#define DS4_DIST_RESULT_VERIFY 4u
+/* Work-frame speculative commit actions (piggybacked on the next frame). */
+#define DS4_DIST_SPEC_ACTION_NONE 0u
+#define DS4_DIST_SPEC_ACTION_KEEP 1u
+#define DS4_DIST_SPEC_ACTION_ROLLBACK 2u
 #define DS4_DIST_ACTIVATION_BITS_DEFAULT 32u
 #define DS4_DIST_ROUTE_F_OUTPUT_LOGITS 0x00000001u
 #define DS4_DIST_ROUTE_RETURN_UPSTREAM 1u
@@ -86,6 +100,8 @@ typedef struct {
     uint32_t n_layers;
     uint32_t listen_port;
     uint32_t model_name_len;
+    /* DSpark draft block size offered by this worker (0 = no speculation). */
+    uint32_t spec_block_size;
 } ds4_dist_hello_fixed;
 
 typedef struct {
@@ -109,6 +125,8 @@ typedef struct {
     uint32_t route_count;
     uint32_t route_index;
     uint32_t route_bytes;
+    /* DS4_DIST_SPEC_ACTION_*: resolves the previous speculative verify. */
+    uint32_t spec_action;
 } ds4_dist_work_fixed;
 
 typedef struct {
@@ -219,6 +237,7 @@ typedef struct ds4_dist_worker_entry {
     uint32_t ctx_size;
     uint32_t n_layers;
     uint32_t listen_port;
+    uint32_t spec_block_size;
     struct ds4_dist_worker_entry *next;
 } ds4_dist_worker_entry;
 
@@ -260,6 +279,11 @@ typedef struct ds4_dist_worker_session {
     uint64_t token_hash;
     bool token_hash_valid;
     ds4_session *session;
+    /* Outstanding speculative verify: pre-verify frontier and token hash,
+     * resolved by the next frame's spec_action (KEEP/ROLLBACK). */
+    ds4_session_spec_frontier *spec_frontier;
+    uint64_t spec_token_hash;
+    uint32_t spec_pos0;
     struct ds4_dist_worker_session *next;
 } ds4_dist_worker_session;
 
@@ -269,6 +293,7 @@ typedef struct {
     uint32_t layer_start;
     uint32_t layer_end;
     bool has_output;
+    bool debug;
     int ctx_size;
     int listen_fd;
     pthread_mutex_t mu;
@@ -350,6 +375,7 @@ typedef struct {
     uint32_t layer_start;
     uint32_t layer_end;
     uint32_t flags;
+    uint32_t spec_block_size;
     int fd;
 } ds4_dist_route_entry;
 
@@ -395,6 +421,9 @@ struct ds4_dist_session {
     uint64_t session_id;
     uint64_t request_id;
     uint64_t snapshot_request_id;
+    /* DS4_DIST_SPEC_ACTION_* carried by the next sent frame (a full-accept
+     * KEEP crosses speculative cycles; ROLLBACK is resolved immediately). */
+    uint32_t spec_pending_action;
 };
 
 typedef struct {
@@ -1467,6 +1496,7 @@ static void dist_hello_to_wire(ds4_dist_hello_fixed *h) {
     h->n_layers = htonl(h->n_layers);
     h->listen_port = htonl(h->listen_port);
     h->model_name_len = htonl(h->model_name_len);
+    h->spec_block_size = htonl(h->spec_block_size);
 }
 
 static void dist_hello_from_wire(ds4_dist_hello_fixed *h) {
@@ -1480,6 +1510,7 @@ static void dist_hello_from_wire(ds4_dist_hello_fixed *h) {
     h->n_layers = ntohl(h->n_layers);
     h->listen_port = ntohl(h->listen_port);
     h->model_name_len = ntohl(h->model_name_len);
+    h->spec_block_size = ntohl(h->spec_block_size);
 }
 
 static uint64_t dist_u64_from_halves(uint32_t hi, uint32_t lo) {
@@ -1555,6 +1586,7 @@ static void dist_work_from_wire(ds4_dist_work_fixed *w) {
     w->route_count = ntohl(w->route_count);
     w->route_index = ntohl(w->route_index);
     w->route_bytes = ntohl(w->route_bytes);
+    w->spec_action = ntohl(w->spec_action);
 }
 
 static void dist_work_to_wire(ds4_dist_work_fixed *w) {
@@ -1578,6 +1610,7 @@ static void dist_work_to_wire(ds4_dist_work_fixed *w) {
     w->route_count = htonl(w->route_count);
     w->route_index = htonl(w->route_index);
     w->route_bytes = htonl(w->route_bytes);
+    w->spec_action = htonl(w->spec_action);
 }
 
 static void dist_route_from_wire(ds4_dist_route_fixed *r) {
@@ -1776,7 +1809,8 @@ static int dist_send_hello(ds4_engine *engine, const ds4_dist_options *opt, int 
         ctx_size > 0 ? (uint32_t)ctx_size : 0u,
         n_layers,
         listen_port,
-        (uint32_t)model_name_len
+        (uint32_t)model_name_len,
+        ds4_engine_dspark_block_size(engine)
     };
     ds4_dist_hello_fixed wire = h;
     dist_hello_to_wire(&wire);
@@ -1879,6 +1913,7 @@ static void dist_coordinator_add_worker(
     entry->ctx_size = hello->ctx_size;
     entry->n_layers = hello->n_layers;
     entry->listen_port = hello->listen_port;
+    entry->spec_block_size = hello->spec_block_size;
 
     pthread_mutex_lock(&state->mu);
     if (state->shutting_down) {
@@ -2268,6 +2303,7 @@ static bool dist_coordinator_build_route_plan(
         entry.layer_start = w->layer_start;
         entry.layer_end = w->layer_end;
         entry.flags = w->has_output ? DS4_DIST_ROUTE_F_OUTPUT_LOGITS : 0u;
+        entry.spec_block_size = w->spec_block_size;
         if (state->use_control_for_work && plan->count == 0) {
             entry.fd = dup(w->fd);
             if (entry.fd < 0) {
@@ -2503,6 +2539,8 @@ static int dist_coordinator_send_remote_work_on_fd(
         uint64_t result_hash,
         bool reset_session,
         bool ack_only,
+        bool spec_verify,
+        uint32_t spec_action,
         const float *hidden_hc,
         uint32_t hidden_hc_bytes,
         char *err,
@@ -2527,6 +2565,8 @@ static int dist_coordinator_send_remote_work_on_fd(
     work.flags = DS4_DIST_WORK_F_INPUT_HC;
     if (reset_session) work.flags |= DS4_DIST_WORK_F_RESET_SESSION;
     if (ack_only) work.flags |= DS4_DIST_WORK_F_ACK_ONLY;
+    if (spec_verify) work.flags |= DS4_DIST_WORK_F_SPEC_VERIFY;
+    work.spec_action = spec_action;
     if ((first->flags & DS4_DIST_ROUTE_F_OUTPUT_LOGITS) != 0) {
         work.flags |= DS4_DIST_WORK_F_OUTPUT_LOGITS;
     }
@@ -2564,9 +2604,12 @@ static int dist_coordinator_eval_remote_on_fd(
         uint64_t prefix_hash,
         uint64_t expected_result_hash,
         bool reset_session,
+        bool spec_verify,
+        uint32_t spec_action,
         const float *hidden_hc,
         uint32_t hidden_hc_bytes,
         float *logits,
+        ds4_dist_spec_result *spec,
         char *err,
         size_t errlen) {
     const bool profile = dist_decode_profile_enabled() && n_tokens == 1;
@@ -2584,6 +2627,8 @@ static int dist_coordinator_eval_remote_on_fd(
                                                      expected_result_hash,
                                                      reset_session,
                                                      false,
+                                                     spec_verify,
+                                                     spec_action,
                                                      hidden_hc,
                                                      hidden_hc_bytes,
                                                      err,
@@ -2637,6 +2682,41 @@ static int dist_coordinator_eval_remote_on_fd(
         }
         return 0;
     }
+    if (kind == DS4_DIST_RESULT_LOGITS_SPEC && payload_bytes >= sizeof(uint32_t)) {
+        const uint32_t draft_len = *(const uint32_t *)payload;
+        const uint64_t expect = (uint64_t)sizeof(uint32_t) * (1u + draft_len) + logits_bytes;
+        if (draft_len > DS4_DSPARK_MAX_BLOCK_SIZE || expect != payload_bytes) {
+            free(payload);
+            if (errlen) snprintf(err, errlen, "distributed route returned invalid speculative logits payload");
+            return 1;
+        }
+        const uint32_t *wire_tokens = (const uint32_t *)payload + 1;
+        memcpy(logits, (const char *)payload + sizeof(uint32_t) * (1u + draft_len), logits_bytes);
+        if (spec) {
+            spec->draft_len = draft_len;
+            for (uint32_t i = 0; i < draft_len; i++) spec->drafts[i] = (int)wire_tokens[i];
+        }
+        free(payload);
+        return 0;
+    }
+    if (kind == DS4_DIST_RESULT_VERIFY && payload_bytes >= sizeof(uint32_t)) {
+        const uint32_t n_rows = *(const uint32_t *)payload;
+        const uint64_t expect = (uint64_t)sizeof(uint32_t) * (1u + n_rows) + logits_bytes;
+        if (n_rows + 1u != n_tokens || n_rows > DS4_DSPARK_MAX_BLOCK_SIZE ||
+            expect != payload_bytes) {
+            free(payload);
+            if (errlen) snprintf(err, errlen, "distributed route returned invalid speculative verify payload");
+            return 1;
+        }
+        const int *wire_tops = (const int *)((const uint32_t *)payload + 1);
+        memcpy(logits, (const char *)payload + sizeof(uint32_t) * (1u + n_rows), logits_bytes);
+        if (spec) {
+            spec->row_tops_len = n_rows;
+            for (uint32_t i = 0; i < n_rows; i++) spec->row_tops[i] = wire_tops[i];
+        }
+        free(payload);
+        return 0;
+    }
     if (kind == DS4_DIST_RESULT_HIDDEN_STATE && payload_bytes == hidden_hc_bytes) {
         const double head_t0 = profile ? dist_now_sec() : 0.0;
         int head_rc = ds4_session_eval_output_head_from_hc(session,
@@ -2667,7 +2747,7 @@ static int dist_coordinator_eval_remote_on_fd(
     return 1;
 }
 
-static int dist_coordinator_eval_span(
+static int dist_coordinator_eval_span_spec(
         ds4_dist_coordinator_state *state,
         ds4_session *session,
         const ds4_dist_route_plan *plan,
@@ -2677,7 +2757,10 @@ static int dist_coordinator_eval_span(
         uint64_t session_id,
         uint64_t request_id,
         bool reset_session,
+        bool spec_verify,
+        uint32_t spec_action,
         float *logits,
+        ds4_dist_spec_result *spec,
         char *err,
         size_t errlen) {
     const bool profile = dist_decode_profile_enabled() && n_tokens == 1;
@@ -2758,9 +2841,12 @@ static int dist_coordinator_eval_span(
                                                 prefix_hash,
                                                 result_hash,
                                                 reset_session,
+                                                spec_verify,
+                                                spec_action,
                                                 hidden,
                                                 hidden_bytes,
                                                 logits,
+                                                spec,
                                                 err,
                                                 errlen);
         remote_t1 = profile ? dist_now_sec() : 0.0;
@@ -2781,6 +2867,36 @@ static int dist_coordinator_eval_span(
     }
     free(hidden);
     return rc;
+}
+
+static int dist_coordinator_eval_span(
+        ds4_dist_coordinator_state *state,
+        ds4_session *session,
+        const ds4_dist_route_plan *plan,
+        const int *tokens,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint64_t session_id,
+        uint64_t request_id,
+        bool reset_session,
+        float *logits,
+        char *err,
+        size_t errlen) {
+    return dist_coordinator_eval_span_spec(state,
+                                           session,
+                                           plan,
+                                           tokens,
+                                           n_tokens,
+                                           pos0,
+                                           session_id,
+                                           request_id,
+                                           reset_session,
+                                           false,
+                                           DS4_DIST_SPEC_ACTION_NONE,
+                                           logits,
+                                           NULL,
+                                           err,
+                                           errlen);
 }
 
 /* =========================================================================
@@ -3231,6 +3347,8 @@ static void *dist_prefill_sender_main(void *arg) {
                                                          slot->result_hash,
                                                          slot->reset_session,
                                                          slot->ack_only,
+                                                         false,
+                                                         DS4_DIST_SPEC_ACTION_NONE,
                                                          slot->hidden,
                                                          slot->hidden_bytes,
                                                          send_err,
@@ -5701,6 +5819,60 @@ int ds4_dist_session_eval(
 }
 
 /* =========================================================================
+ * Distributed DSpark Speculation (Coordinator Side)
+ * ========================================================================= */
+
+uint32_t ds4_dist_session_spec_block_size(ds4_dist_session *d) {
+    if (!d || !d->plan_ready || d->plan.count == 0) return 0;
+    const ds4_dist_route_entry *last = &d->plan.entry[d->plan.count - 1u];
+    if ((last->flags & DS4_DIST_ROUTE_F_OUTPUT_LOGITS) == 0) return 0;
+    return last->spec_block_size;
+}
+
+int ds4_dist_session_eval_spec_span(
+        ds4_dist_session *d,
+        ds4_session *owner,
+        const int *tokens,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        bool spec_verify,
+        float *logits,
+        ds4_dist_spec_result *spec,
+        char *err,
+        size_t errlen) {
+    if (!d || !owner || !tokens || n_tokens == 0 || !logits) {
+        if (errlen) snprintf(err, errlen, "invalid distributed speculative span request");
+        return 1;
+    }
+    if (dist_session_ensure_route(d, err, errlen) != 0) return 1;
+    const uint32_t action = d->spec_pending_action;
+    d->spec_pending_action = DS4_DIST_SPEC_ACTION_NONE;
+    if (spec) memset(spec, 0, sizeof(*spec));
+    return dist_coordinator_eval_span_spec(&d->state,
+                                           owner,
+                                           &d->plan,
+                                           tokens,
+                                           n_tokens,
+                                           pos0,
+                                           d->session_id,
+                                           d->request_id++,
+                                           false,
+                                           spec_verify,
+                                           action,
+                                           logits,
+                                           spec,
+                                           err,
+                                           errlen);
+}
+
+void ds4_dist_session_spec_resolve(ds4_dist_session *d, bool keep) {
+    if (d) {
+        d->spec_pending_action = keep ? DS4_DIST_SPEC_ACTION_KEEP
+                                      : DS4_DIST_SPEC_ACTION_ROLLBACK;
+    }
+}
+
+/* =========================================================================
  * Standalone Coordinator Entrypoint
  * ========================================================================= */
 
@@ -5860,7 +6032,9 @@ static int dist_send_work_result(
         hidden_values = payload_bytes / (uint32_t)sizeof(float);
         if (!dist_activation_wire_bytes(payload_bits, hidden_values, &wire_payload_bytes))
             return -1;
-    } else if (status == 0 && result_kind == DS4_DIST_RESULT_LOGITS) {
+    } else if (status == 0 && (result_kind == DS4_DIST_RESULT_LOGITS ||
+                               result_kind == DS4_DIST_RESULT_LOGITS_SPEC ||
+                               result_kind == DS4_DIST_RESULT_VERIFY)) {
         payload_bits = 32u;
     } else {
         payload_bits = 0;
@@ -6838,6 +7012,7 @@ static uint32_t dist_worker_clear_sessions(ds4_dist_worker_state *state) {
 
     while (it) {
         ds4_dist_worker_session *next = it->next;
+        ds4_session_spec_frontier_free(it->spec_frontier);
         ds4_session_free(it->session);
         free(it);
         it = next;
@@ -7377,6 +7552,12 @@ static int dist_worker_process_work_payload(
             return dist_worker_upstream_send_work_error(upstream, request_id, err);
         }
     }
+    const bool spec_verify = (work.flags & DS4_DIST_WORK_F_SPEC_VERIFY) != 0;
+    if (spec_verify && (ack_only || work.n_tokens > DS4_DSPARK_MAX_BLOCK_SIZE)) {
+        free(route_blob);
+        free(tokens);
+        return dist_worker_upstream_send_work_error(upstream, request_id, "invalid speculative verify WORK frame");
+    }
     if (has_next && output_logits) {
         free(route_blob);
         free(tokens);
@@ -7400,9 +7581,17 @@ static int dist_worker_process_work_payload(
     const bool final_ack_only = ack_only && !has_next;
     const bool local_output_logits = output_logits && !has_next && !final_ack_only;
     const bool produce_hidden = !local_output_logits && !final_ack_only;
-    const uint32_t result_kind = final_ack_only
+    if (spec_verify && !has_next && !local_output_logits) {
+        free(route_blob);
+        free(tokens);
+        return dist_worker_upstream_send_work_error(upstream, request_id, "speculative verify requires the output head on the final hop");
+    }
+    const uint32_t base_result_kind = final_ack_only
         ? DS4_DIST_RESULT_ACK
         : (local_output_logits ? DS4_DIST_RESULT_LOGITS : DS4_DIST_RESULT_HIDDEN_STATE);
+    uint32_t result_kind = (spec_verify && local_output_logits)
+        ? DS4_DIST_RESULT_VERIFY
+        : base_result_kind;
     const uint32_t result_bytes = final_ack_only
         ? 0u
         : (local_output_logits
@@ -7478,6 +7667,41 @@ static int dist_worker_process_work_payload(
         session->token_hash = dist_token_hash_prefix(timeline->v, (uint32_t)timeline->len);
         session->token_hash_valid = true;
     }
+    if (work.spec_action != DS4_DIST_SPEC_ACTION_NONE) {
+        if (!session->spec_frontier) {
+            pthread_mutex_unlock(&state->mu);
+            if (!input_hc_uses_wire) free(input_hc);
+            free(result);
+            free(route_blob);
+            free(tokens);
+            return dist_worker_upstream_send_work_error(upstream, request_id, "speculative commit without a pending verify");
+        }
+        if (work.spec_action == DS4_DIST_SPEC_ACTION_ROLLBACK) {
+            if (ds4_session_spec_rollback(session->session,
+                                          session->spec_frontier,
+                                          session->spec_pos0,
+                                          err,
+                                          sizeof(err)) != 0) {
+                pthread_mutex_unlock(&state->mu);
+                if (!input_hc_uses_wire) free(input_hc);
+                free(result);
+                free(route_blob);
+                free(tokens);
+                return dist_worker_upstream_send_work_error(upstream, request_id, err);
+            }
+            session->token_hash = session->spec_token_hash;
+            session->token_hash_valid = true;
+        } else if (work.spec_action != DS4_DIST_SPEC_ACTION_KEEP) {
+            pthread_mutex_unlock(&state->mu);
+            if (!input_hc_uses_wire) free(input_hc);
+            free(result);
+            free(route_blob);
+            free(tokens);
+            return dist_worker_upstream_send_work_error(upstream, request_id, "invalid speculative commit action");
+        }
+        ds4_session_spec_frontier_free(session->spec_frontier);
+        session->spec_frontier = NULL;
+    }
     if (session->token_hash != work_prefix_hash) {
         pthread_mutex_unlock(&state->mu);
         if (!input_hc_uses_wire) free(input_hc);
@@ -7487,7 +7711,37 @@ static int dist_worker_process_work_payload(
         return dist_worker_upstream_send_work_error(upstream, request_id, "worker KV prefix hash mismatch");
     }
     const double eval_t0 = dist_now_sec();
-    int eval_rc = ds4_session_eval_layer_slice(session->session,
+    int row_tops[DS4_DSPARK_MAX_BLOCK_SIZE];
+    int spec_drafts[DS4_DSPARK_MAX_BLOCK_SIZE];
+    uint32_t spec_draft_len = 0;
+    int eval_rc;
+    if (spec_verify && local_output_logits) {
+        /* Snapshot the pre-verify frontier so the coordinator's accept/reject
+         * decision (carried by the next frame's spec_action) can commit or
+         * roll back the speculative KV rows. */
+        ds4_session_spec_frontier_free(session->spec_frontier);
+        session->spec_frontier =
+            ds4_session_spec_frontier_snapshot(session->session);
+        session->spec_token_hash = session->token_hash;
+        session->spec_pos0 = work.pos0;
+        if (!session->spec_frontier) {
+            snprintf(err, sizeof(err), "speculative frontier snapshot failed");
+            eval_rc = 1;
+        } else {
+            eval_rc = ds4_session_eval_layer_slice_verify(session->session,
+                                                          tokens,
+                                                          work.n_tokens,
+                                                          work.pos0,
+                                                          work.layer_start,
+                                                          work.layer_end,
+                                                          input_hc,
+                                                          row_tops,
+                                                          result,
+                                                          err,
+                                                          sizeof(err));
+        }
+    } else {
+        eval_rc = ds4_session_eval_layer_slice(session->session,
                                                tokens,
                                                work.n_tokens,
                                                work.pos0,
@@ -7499,10 +7753,30 @@ static int dist_worker_process_work_payload(
                                                local_output_logits ? result : NULL,
                                                err,
                                                sizeof(err));
+    }
     const double eval_t1 = dist_now_sec();
     if (eval_rc == 0) {
         session->token_hash = work_result_hash;
         session->token_hash_valid = true;
+        /* DSpark: the final-hop worker owns the target layers, so prepare the
+         * draft locally right after the committed token's slice eval. The
+         * proposal rides back on the RESULT frame as DS4_DIST_RESULT_LOGITS_SPEC. */
+        if (local_output_logits && work.n_tokens == 1) {
+            spec_draft_len =
+                ds4_session_dspark_prepare_draft(session->session,
+                                                 tokens[0],
+                                                 work.pos0,
+                                                 spec_drafts,
+                                                 DS4_DSPARK_MAX_BLOCK_SIZE);
+            if (spec_draft_len > 0 && state->debug) {
+                fprintf(stderr, "ds4: dist worker dspark draft len=%u tokens=",
+                        spec_draft_len);
+                for (uint32_t i = 0; i < spec_draft_len; i++) {
+                    fprintf(stderr, "%s%d", i ? "," : "", spec_drafts[i]);
+                }
+                fputc('\n', stderr);
+            }
+        }
     } else {
         session->token_hash_valid = false;
     }
@@ -7562,6 +7836,39 @@ static int dist_worker_process_work_payload(
                                             &telemetry,
                                             route_blob);
     } else {
+        /* Speculative payloads prepend a small header to the logits vector:
+         * VERIFY carries the per-row argmax, LOGITS_SPEC the draft proposal. */
+        uint32_t spec_extra_bytes = 0;
+        if (result_kind == DS4_DIST_RESULT_VERIFY) {
+            spec_extra_bytes = (uint32_t)sizeof(uint32_t) * work.n_tokens;
+        } else if (result_kind == DS4_DIST_RESULT_LOGITS && spec_draft_len > 0) {
+            result_kind = DS4_DIST_RESULT_LOGITS_SPEC;
+            spec_extra_bytes = (uint32_t)sizeof(uint32_t) * (1u + spec_draft_len);
+        }
+        void *send_payload = result;
+        uint32_t send_bytes = result_bytes;
+        if (spec_extra_bytes != 0) {
+            send_bytes = result_bytes + spec_extra_bytes;
+            send_payload = malloc(send_bytes);
+            if (!send_payload) {
+                if (!input_hc_uses_wire) free(input_hc);
+                free(result);
+                free(route_blob);
+                free(tokens);
+                return dist_worker_upstream_send_work_error(upstream, request_id, "out of memory allocating speculative result");
+            }
+            uint32_t *hdr = (uint32_t *)send_payload;
+            if (result_kind == DS4_DIST_RESULT_VERIFY) {
+                hdr[0] = work.n_tokens - 1u;
+                memcpy(hdr + 1, row_tops,
+                       (size_t)(work.n_tokens - 1u) * sizeof(int));
+            } else {
+                hdr[0] = spec_draft_len;
+                memcpy(hdr + 1, spec_drafts,
+                       (size_t)spec_draft_len * sizeof(int));
+            }
+            memcpy((char *)send_payload + spec_extra_bytes, result, result_bytes);
+        }
         send_rc = dist_worker_upstream_send_work_result(upstream,
                                                         request_id,
                                                         work_result_hash,
@@ -7570,8 +7877,9 @@ static int dist_worker_process_work_payload(
                                                         result_kind == DS4_DIST_RESULT_HIDDEN_STATE ? input_hc_bits : 32u,
                                                         &telemetry,
                                                         1,
-                                                        result,
-                                                        result_bytes);
+                                                        send_payload,
+                                                        send_bytes);
+        if (send_payload != (void *)result) free(send_payload);
     }
     const double send_t1 = profile ? dist_now_sec() : 0.0;
     if (profile) {
@@ -7952,6 +8260,7 @@ static int dist_run_worker(ds4_engine *engine, const ds4_dist_options *opt, int 
     state.layer_start = opt->layers.start;
     state.layer_end = dist_resolved_layer_end(opt, (uint32_t)ds4_engine_layer_count(engine));
     state.has_output = opt->layers.has_output;
+    state.debug = opt->debug;
     state.ctx_size = ctx_size;
     state.listen_fd = listen_fd;
     pthread_mutex_init(&state.mu, NULL);

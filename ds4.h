@@ -417,6 +417,12 @@ int ds4_engine_routed_quant_bits(ds4_engine *e);
 bool ds4_engine_has_output_head(ds4_engine *e);
 bool ds4_engine_has_mtp(ds4_engine *e);
 int ds4_engine_mtp_draft_tokens(ds4_engine *e);
+uint32_t ds4_engine_dspark_block_size(ds4_engine *e);
+
+/* Draft tokens available to this session's speculative loop: the engine's
+ * local MTP/DSpark, or the DSpark block size advertised by the distributed
+ * route's final hop. */
+int ds4_session_spec_draft_tokens(ds4_session *s);
 const ds4_tokens *ds4_session_tokens(ds4_session *s);
 
 /* Low-level graph slice entry points used by distributed inference.  The
@@ -440,6 +446,55 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
                                          float *logits,
                                          char *err,
                                          size_t errlen);
+
+#ifndef DS4_DSPARK_MAX_BLOCK_SIZE
+#define DS4_DSPARK_MAX_BLOCK_SIZE 16
+#endif
+
+/* Runs the DSpark draft on a distributed worker for the just-committed
+ * token and copies the proposal into draft_tokens. Returns the draft length,
+ * or 0 when DSpark is disabled / capture stale / buffer too small. */
+uint32_t ds4_session_dspark_prepare_draft(ds4_session *s,
+                                          int token,
+                                          uint32_t pos,
+                                          int *draft_tokens,
+                                          uint32_t draft_cap);
+
+/* Speculative-verify variant of ds4_session_eval_layer_slice for the final
+ * distributed hop: per-row argmax for rows 0..n_tokens-2 plus the full
+ * logits of the last row. */
+int ds4_session_eval_layer_slice_verify(ds4_session *s,
+                                        const int *tokens,
+                                        uint32_t n_tokens,
+                                        uint32_t pos0,
+                                        uint32_t layer_start,
+                                        uint32_t layer_end,
+                                        const float *input_hc,
+                                        int *row_tops,
+                                        float *last_row_logits,
+                                        char *err,
+                                        size_t errlen);
+
+/* Opaque speculative frontier: snapshots the session's compressor/KV
+ * counters so a speculative verify can be rolled back. At most one snapshot
+ * per session may be outstanding. */
+typedef struct ds4_session_spec_frontier ds4_session_spec_frontier;
+ds4_session_spec_frontier *ds4_session_spec_frontier_snapshot(ds4_session *s);
+int ds4_session_spec_rollback(ds4_session *s,
+                              ds4_session_spec_frontier *f,
+                              uint32_t checkpoint_len,
+                              char *err,
+                              size_t errlen);
+void ds4_session_spec_frontier_free(ds4_session_spec_frontier *f);
+
+/* Speculative payloads unpacked from distributed LOGITS_SPEC / VERIFY
+ * results (see ds4_distributed.c). */
+typedef struct {
+    uint32_t draft_len;
+    int drafts[DS4_DSPARK_MAX_BLOCK_SIZE];
+    uint32_t row_tops_len;
+    int row_tops[DS4_DSPARK_MAX_BLOCK_SIZE];
+} ds4_dist_spec_result;
 
 /* Disk KV payload helpers.  HTTP/agent code owns the outer file header and
  * persistence policy; the engine owns the DS4-specific serialized graph state. */
