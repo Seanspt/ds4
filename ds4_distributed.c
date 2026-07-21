@@ -73,7 +73,9 @@
  * u32 draft_len, draft_len x u32 token ids, vocab x f32 logits. */
 #define DS4_DIST_RESULT_LOGITS_SPEC 3u
 /* Speculative verify result:
- * u32 n_rows, n_rows x i32 row argmax, vocab x f32 last-row logits. */
+ * u32 accept count (1..n_tokens), vocab x f32 accepted-prefix logits.
+ * On partial accept the worker has already rolled back and replayed the
+ * accepted prefix locally; the logits are the replay's last row. */
 #define DS4_DIST_RESULT_VERIFY 4u
 /* Work-frame speculative commit actions (piggybacked on the next frame). */
 #define DS4_DIST_SPEC_ACTION_NONE 0u
@@ -2707,20 +2709,15 @@ static int dist_coordinator_eval_remote_on_fd(
         return 0;
     }
     if (kind == DS4_DIST_RESULT_VERIFY && payload_bytes >= sizeof(uint32_t)) {
-        const uint32_t n_rows = *(const uint32_t *)payload;
-        const uint64_t expect = (uint64_t)sizeof(uint32_t) * (1u + n_rows) + logits_bytes;
-        if (n_rows + 1u != n_tokens || n_rows > DS4_DSPARK_MAX_BLOCK_SIZE ||
-            expect != payload_bytes) {
+        const uint32_t commit = *(const uint32_t *)payload;
+        const uint64_t expect = (uint64_t)sizeof(uint32_t) + logits_bytes;
+        if (commit < 1u || commit > n_tokens || expect != payload_bytes) {
             free(payload);
             if (errlen) snprintf(err, errlen, "distributed route returned invalid speculative verify payload");
             return 1;
         }
-        const int *wire_tops = (const int *)((const uint32_t *)payload + 1);
-        memcpy(logits, (const char *)payload + sizeof(uint32_t) * (1u + n_rows), logits_bytes);
-        if (spec) {
-            spec->row_tops_len = n_rows;
-            for (uint32_t i = 0; i < n_rows; i++) spec->row_tops[i] = wire_tops[i];
-        }
+        memcpy(logits, (const char *)payload + sizeof(uint32_t), logits_bytes);
+        if (spec) spec->commit = commit;
         free(payload);
         return 0;
     }
@@ -5840,6 +5837,13 @@ uint32_t ds4_dist_session_spec_block_size(ds4_dist_session *d) {
     return last->spec_block_size;
 }
 
+void ds4_dist_session_local_layer_range(ds4_dist_session *d,
+                                        uint32_t *layer_start,
+                                        uint32_t *layer_end) {
+    if (layer_start) *layer_start = d ? d->state.local_start : 0;
+    if (layer_end) *layer_end = d ? d->state.local_end : 0;
+}
+
 int ds4_dist_session_eval_spec_span(
         ds4_dist_session *d,
         ds4_session *owner,
@@ -7727,11 +7731,13 @@ static int dist_worker_process_work_payload(
     int row_tops[DS4_DSPARK_MAX_BLOCK_SIZE];
     int spec_drafts[DS4_DSPARK_MAX_BLOCK_SIZE];
     uint32_t spec_draft_len = 0;
+    uint32_t spec_commit = 0;
     int eval_rc;
     if (spec_verify && local_output_logits) {
-        /* Snapshot the pre-verify frontier so the coordinator's accept/reject
-         * decision (carried by the next frame's spec_action) can commit or
-         * roll back the speculative KV rows. */
+        /* Snapshot the pre-verify frontier, then resolve locally: full
+         * accept keeps the batch KV (the coordinator sends KEEP on a later
+         * frame); partial accept rolls back and replays the accepted prefix
+         * as one batch right here — no extra network round trips. */
         ds4_session_spec_frontier_free(session->spec_frontier);
         session->spec_frontier =
             ds4_session_spec_frontier_snapshot(session->session);
@@ -7752,6 +7758,40 @@ static int dist_worker_process_work_payload(
                                                           result,
                                                           err,
                                                           sizeof(err));
+            if (eval_rc == 0) {
+                /* The span tokens are this worker's own draft proposal, so
+                 * the accept count is computed exactly like the
+                 * coordinator would. */
+                spec_commit = 1;
+                for (uint32_t i = 1; i < work.n_tokens; i++) {
+                    if (row_tops[i - 1] != tokens[i]) break;
+                    spec_commit++;
+                }
+                if (spec_commit < work.n_tokens) {
+                    if (ds4_session_spec_rollback(session->session,
+                                                  session->spec_frontier,
+                                                  session->spec_pos0,
+                                                  err,
+                                                  sizeof(err)) != 0) {
+                        eval_rc = 1;
+                    } else {
+                        eval_rc = ds4_session_eval_layer_slice(session->session,
+                                                               tokens,
+                                                               spec_commit,
+                                                               work.pos0,
+                                                               work.layer_start,
+                                                               work.layer_end,
+                                                               input_hc,
+                                                               NULL,
+                                                               true,
+                                                               result,
+                                                               err,
+                                                               sizeof(err));
+                    }
+                    ds4_session_spec_frontier_free(session->spec_frontier);
+                    session->spec_frontier = NULL;
+                }
+            }
         }
     } else {
         eval_rc = ds4_session_eval_layer_slice(session->session,
@@ -7769,7 +7809,13 @@ static int dist_worker_process_work_payload(
     }
     const double eval_t1 = dist_now_sec();
     if (eval_rc == 0) {
-        session->token_hash = work_result_hash;
+        if (spec_verify && local_output_logits && spec_commit < work.n_tokens) {
+            session->token_hash = dist_token_hash_update_span(session->spec_token_hash,
+                                                              tokens,
+                                                              spec_commit);
+        } else {
+            session->token_hash = work_result_hash;
+        }
         session->token_hash_valid = true;
         /* DSpark: the final-hop worker owns the target layers, so prepare the
          * draft locally right after the committed token's slice eval. The
@@ -7853,10 +7899,10 @@ static int dist_worker_process_work_payload(
                                             route_blob);
     } else {
         /* Speculative payloads prepend a small header to the logits vector:
-         * VERIFY carries the per-row argmax, LOGITS_SPEC the draft proposal. */
+         * VERIFY carries the accept count, LOGITS_SPEC the draft proposal. */
         uint32_t spec_extra_bytes = 0;
         if (result_kind == DS4_DIST_RESULT_VERIFY) {
-            spec_extra_bytes = (uint32_t)sizeof(uint32_t) * work.n_tokens;
+            spec_extra_bytes = (uint32_t)sizeof(uint32_t);
         } else if (result_kind == DS4_DIST_RESULT_LOGITS && spec_draft_len > 0) {
             result_kind = DS4_DIST_RESULT_LOGITS_SPEC;
             spec_extra_bytes = (uint32_t)sizeof(uint32_t) * (1u + spec_draft_len);
@@ -7875,9 +7921,7 @@ static int dist_worker_process_work_payload(
             }
             uint32_t *hdr = (uint32_t *)send_payload;
             if (result_kind == DS4_DIST_RESULT_VERIFY) {
-                hdr[0] = work.n_tokens - 1u;
-                memcpy(hdr + 1, row_tops,
-                       (size_t)(work.n_tokens - 1u) * sizeof(int));
+                hdr[0] = spec_commit;
             } else {
                 hdr[0] = spec_draft_len;
                 memcpy(hdr + 1, spec_drafts,

@@ -493,8 +493,7 @@ void ds4_session_spec_frontier_free(ds4_session_spec_frontier *f);
 typedef struct {
     uint32_t draft_len;
     int drafts[DS4_DSPARK_MAX_BLOCK_SIZE];
-    uint32_t row_tops_len;
-    int row_tops[DS4_DSPARK_MAX_BLOCK_SIZE];
+    uint32_t commit;
 } ds4_dist_spec_result;
 
 /* Disk KV payload helpers.  HTTP/agent code owns the outer file header and

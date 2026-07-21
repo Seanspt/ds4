@@ -64259,11 +64259,7 @@ static int ds4_session_eval_dist_dspark_speculative_argmax(
         return -1;
     }
 
-    int commit = 1;
-    for (int i = 1; i < draft_n; i++) {
-        if (vspec.row_tops[i - 1] != drafts[i]) break;
-        commit++;
-    }
+    int commit = (int)vspec.commit;
 
     if (commit == draft_n) {
         /* Full accept: the batch KV written by the verify is kept on both
@@ -64282,32 +64278,39 @@ static int ds4_session_eval_dist_dspark_speculative_argmax(
         return n_accept;
     }
 
-    /* Partial accept: roll both nodes back to the pre-verify frontier, then
-     * replay the accepted tokens through exact decode. The first replay
-     * frame carries the ROLLBACK action to the worker. */
+    /* Partial accept: the worker already rolled back and replayed the
+     * accepted prefix locally (row_logits is its replay's last row), so its
+     * frontier is resolved — nothing to send. Mirror the rollback on the
+     * coordinator: restore the pre-verify frontier, then replay the accepted
+     * prefix through the local slice — no network round trips. */
     log_partial++;
     DIST_SPEC_LOG("partial", draft_n, commit);
-    ds4_dist_session_spec_resolve(s->distributed, false);
     const int rollback_rc = ds4_session_spec_rollback(s, frontier, start, err, errlen);
     ds4_session_spec_frontier_free(frontier);
+    if (rollback_rc != 0) {
+        free(row_logits);
+        return -1;
+    }
+    uint32_t local_start = 0, local_end = 0;
+    ds4_dist_session_local_layer_range(s->distributed, &local_start, &local_end);
+    if (ds4_session_eval_layer_slice(s,
+                                     drafts,
+                                     (uint32_t)commit,
+                                     start,
+                                     local_start,
+                                     local_end,
+                                     NULL,
+                                     NULL,
+                                     false,
+                                     NULL,
+                                     err,
+                                     errlen) != 0) {
+        free(row_logits);
+        return -1;
+    }
+    memcpy(s->logits, row_logits, logits_bytes);
     free(row_logits);
-    if (rollback_rc != 0) return -1;
-
     for (int i = 0; i < commit && n_accept < max_tokens; i++) {
-        ds4_dist_spec_result rspec;
-        if (ds4_dist_session_eval_spec_span(s->distributed,
-                                            s,
-                                            &drafts[i],
-                                            1,
-                                            (uint32_t)s->checkpoint.len,
-                                            false,
-                                            true,
-                                            s->logits,
-                                            &rspec,
-                                            err,
-                                            errlen) != 0) {
-            return -1;
-        }
         accepted[n_accept++] = drafts[i];
         if (drafts[i] == eos_token) break;
     }

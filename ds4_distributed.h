@@ -121,6 +121,11 @@ int ds4_dist_session_eval_spec_span(
         size_t errlen);
 void ds4_dist_session_spec_resolve(ds4_dist_session *d, bool keep);
 
+/* The coordinator's own layer slice (used for local speculative replays). */
+void ds4_dist_session_local_layer_range(ds4_dist_session *d,
+                                        uint32_t *layer_start,
+                                        uint32_t *layer_end);
+
 /* Save/load use the normal DSV4 payload format. The coordinator gathers or
  * pushes remote layer shards internally so saved files are topology-neutral.
  */
