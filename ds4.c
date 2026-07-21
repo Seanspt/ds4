@@ -51244,6 +51244,8 @@ static int ds4_session_eval_splitkv_spec_after_first(
  * 4. fall back to ordinary one-token decode if the fast verifier cannot prove
  *    the target stream. */
 
+static const char *ds4_session_spec_suffix(const ds4_session *s);
+
 int ds4_engine_generate_argmax(
         ds4_engine        *e,
         const ds4_tokens  *prompt,
@@ -51315,9 +51317,10 @@ int ds4_engine_generate_argmax(
             if (done) done(emit_ud);
             ds4_log(stderr,
                     DS4_LOG_TIMING,
-                    "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
+                    "ds4: prefill: %.2f t/s, generation: %.2f t/s%s\n",
                     (t_prefill1 - t_prefill0) > 0.0 ? (double)prompt->len / (t_prefill1 - t_prefill0) : 0.0,
-                    (t_decode1 - t_decode0) > 0.0 ? (double)n_generated / (t_decode1 - t_decode0) : 0.0);
+                    (t_decode1 - t_decode0) > 0.0 ? (double)n_generated / (t_decode1 - t_decode0) : 0.0,
+                    ds4_session_spec_suffix(s));
             ds4_session_free(s);
             return rc;
         }
@@ -56321,6 +56324,37 @@ void ds4_engine_close(ds4_engine *e) {
 static bool ds4_dspark_stats_enabled(void) {
     const char *env = getenv("DS4_DSPARK_STATS");
     return env && env[0] && strcmp(env, "0") != 0;
+}
+
+/*
+ * Returns a short suffix string with speculative-decode acceptance stats,
+ * or "" when no speculative decode was active during this session.
+ */
+static const char *ds4_session_spec_suffix(const ds4_session *s) {
+    if (!s) return "";
+#ifndef DS4_NO_GPU
+    if (ds4_dspark_stats_enabled()) {
+        const ds4_dspark_spec_stats *st = &s->dspark_stats;
+        if (st->proposed_tokens == 0) return "";
+        static char buf[96];
+        const double rate = (100.0 * (double)st->accepted_draft_tokens /
+                             (double)st->proposed_tokens);
+        const double avg = st->cycles
+            ? (double)st->accepted_draft_tokens / (double)st->cycles : 0.0;
+        snprintf(buf, sizeof(buf),
+                 " | spec accept %.1f%% avg %.2ftk", rate, avg);
+        return buf;
+    }
+#endif
+    if (s->mtp_probe_total > 0) {
+        static char buf[64];
+        snprintf(buf, sizeof(buf),
+                 " | mtp %llu/%llu hits",
+                 (unsigned long long)s->mtp_probe_hit,
+                 (unsigned long long)s->mtp_probe_total);
+        return buf;
+    }
+    return "";
 }
 
 static void ds4_format_len_hist(
