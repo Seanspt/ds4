@@ -55322,10 +55322,15 @@ static int ds4_engine_open_internal(ds4_engine **out,
         return 1;
     }
     if (opt->dspark && (!opt->mtp_path || !opt->mtp_path[0])) {
-        fprintf(stderr, "ds4: --dspark requires --mtp FILE\n");
-        free(e);
-        *out = NULL;
-        return 1;
+        /* A distributed coordinator carries no support model: its --dspark
+         * only enables the speculative loop against the worker-advertised
+         * draft. Every other role still needs the file locally. */
+        if (opt->distributed.role != DS4_DISTRIBUTED_COORDINATOR) {
+            fprintf(stderr, "ds4: --dspark requires --mtp FILE\n");
+            free(e);
+            *out = NULL;
+            return 1;
+        }
     }
     if ((opt->directional_steering_attn != 0.0f || opt->directional_steering_ffn != 0.0f) &&
         (!opt->directional_steering_file || !opt->directional_steering_file[0]))
