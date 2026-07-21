@@ -5719,21 +5719,38 @@ static void config_validate_model(const ds4_model *m) {
 }
 
 static void weights_bind_output(ds4_weights *w, const ds4_model *m, bool required) {
+    /*
+     * Always try to resolve output tensors so graph allocation can read
+     * vocab_dim even when the current process doesn't own the output head
+     * (e.g. distributed coordinator with --layers 0:N without +output).
+     * When required is true, missing tensors are fatal; otherwise NULL is
+     * fine and the graph allocator falls back to DS4_N_VOCAB.
+     */
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
-        if (required) {
-            w->output_norm = required_tensor(m, "output_norm.weight");
-            w->output      = required_tensor(m, "output.weight");
-        }
+        w->output_norm = required
+            ? required_tensor(m, "output_norm.weight")
+            : model_find_tensor(m, "output_norm.weight");
+        w->output = required
+            ? required_tensor(m, "output.weight")
+            : model_find_tensor(m, "output.weight");
         return;
     }
 
-    if (required) {
-        w->output_hc_base   = required_tensor(m, "output_hc_base.weight");
-        w->output_hc_fn     = required_tensor(m, "output_hc_fn.weight");
-        w->output_hc_scale  = required_tensor(m, "output_hc_scale.weight");
-        w->output_norm      = required_tensor(m, "output_norm.weight");
-        w->output           = required_tensor(m, "output.weight");
-    }
+    w->output_hc_base   = required
+        ? required_tensor(m, "output_hc_base.weight")
+        : model_find_tensor(m, "output_hc_base.weight");
+    w->output_hc_fn     = required
+        ? required_tensor(m, "output_hc_fn.weight")
+        : model_find_tensor(m, "output_hc_fn.weight");
+    w->output_hc_scale  = required
+        ? required_tensor(m, "output_hc_scale.weight")
+        : model_find_tensor(m, "output_hc_scale.weight");
+    w->output_norm      = required
+        ? required_tensor(m, "output_norm.weight")
+        : model_find_tensor(m, "output_norm.weight");
+    w->output           = required
+        ? required_tensor(m, "output.weight")
+        : model_find_tensor(m, "output.weight");
 }
 
 static void weights_bind_glm_dsa_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
@@ -16823,7 +16840,9 @@ static bool metal_graph_alloc_raw_cap(
     const uint64_t group_dim = (uint64_t)DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP);
     const uint64_t shared_dim = layer->ffn_gate_shexp->dim[1];
     const uint64_t routed_mid_dim = layer->ffn_gate_exps->dim[1];
-    const uint64_t vocab_dim = weights->output->dim[1];
+    const uint64_t vocab_dim = weights->output
+        ? weights->output->dim[1]
+        : DS4_N_VOCAB;
     const uint64_t comp_width_max = 2ull * (DS4_N_HEAD_DIM > DS4_N_INDEXER_HEAD_DIM
         ? DS4_N_HEAD_DIM
         : DS4_N_INDEXER_HEAD_DIM);
@@ -25202,7 +25221,9 @@ static int metal_graph_decode_test(
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
-    const uint64_t vocab_dim = weights->output->dim[1];
+    const uint64_t vocab_dim = weights->output
+        ? weights->output->dim[1]
+        : DS4_N_VOCAB;
     const bool routed_q8_0 =
         layer->ffn_gate_exps->type == DS4_TENSOR_Q8_0 &&
         layer->ffn_up_exps->type == DS4_TENSOR_Q8_0 &&
@@ -25460,7 +25481,9 @@ static int metal_graph_first_token_full_test(
 
     const int token = prompt->v[0];
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
-    const uint64_t vocab_dim = weights->output->dim[1];
+    const uint64_t vocab_dim = weights->output
+        ? weights->output->dim[1]
+        : DS4_N_VOCAB;
     float *cpu_hc = xmalloc((size_t)hc_dim * sizeof(float));
     float *gpu_hc = xmalloc((size_t)hc_dim * sizeof(float));
     float *cpu_logits = xmalloc((size_t)vocab_dim * sizeof(float));
