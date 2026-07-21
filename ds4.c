@@ -60559,7 +60559,6 @@ static int ds4_session_eval_dspark_speculative_argmax(
 #define DS4_DSPARK_SCHED_EXTRA_MS()                                         \
     ((scheduler_enabled && stats_t0 != 0.0) ?                                \
      s->dspark_last_propose_ms + (now_sec() - stats_t0) * 1000.0 : 0.0)
-    s->dspark_stats.cycles++;
     if (stats_enabled && n_accept > 0) s->dspark_stats.first_tokens++;
     if (spec_log) {
         fprintf(stderr,
@@ -60626,6 +60625,7 @@ static int ds4_session_eval_dspark_speculative_argmax(
         }
     }
     s->dspark_stats.proposed_tokens += (uint64_t)draft_n;
+    s->dspark_stats.cycles++;
     if (stats_enabled) {
         ds4_dspark_stats_note_len(s->dspark_stats.draft_len_hist,
                                   (uint32_t)draft_n);
