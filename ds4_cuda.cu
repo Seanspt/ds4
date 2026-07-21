@@ -87,6 +87,40 @@ static uint64_t g_model_registered_size;
 static int g_model_registered;
 static thread_local bool g_glm_mtp_verify_mode;
 static int g_model_device_owned;
+/* Auxiliary live model maps (e.g. a DSpark support model on the same
+ * engine). Historically there was a single registration slot and loading a
+ * support model swapped it away from the base model, after which every
+ * base-weight resolution returned a raw host pointer and the next kernel
+ * faulted. Weight resolution is now per-map. */
+#define DS4_CUDA_MAX_AUX_MODEL_MAPS 4
+static struct {
+    const void *host_base;
+    const char *device_base;
+    uint64_t size;
+    int registered;
+} g_model_aux_maps[DS4_CUDA_MAX_AUX_MODEL_MAPS];
+static uint32_t g_model_aux_count;
+
+static const char *cuda_model_aux_ptr(const void *model_map, uint64_t offset) {
+    for (uint32_t i = 0; i < g_model_aux_count; i++) {
+        if (g_model_aux_maps[i].host_base == model_map &&
+            g_model_aux_maps[i].registered &&
+            g_model_aux_maps[i].device_base) {
+            return g_model_aux_maps[i].device_base + offset;
+        }
+    }
+    return NULL;
+}
+
+static void cuda_model_aux_maps_release_all(void) {
+    for (uint32_t i = 0; i < g_model_aux_count; i++) {
+        if (g_model_aux_maps[i].registered && g_model_aux_maps[i].host_base) {
+            (void)cudaHostUnregister((void *)g_model_aux_maps[i].host_base);
+        }
+    }
+    memset(g_model_aux_maps, 0, sizeof(g_model_aux_maps));
+    g_model_aux_count = 0;
+}
 static int g_model_range_mapping_supported = 1;
 static int g_model_hmm_direct;
 static int g_model_fd = -1;
@@ -535,12 +569,17 @@ static int cuda_attention_score_buffer_fits(uint32_t n_comp) {
 
 static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
     if (model_map == g_model_host_base && g_model_device_base) return g_model_device_base + offset;
+    const char *aux = cuda_model_aux_ptr(model_map, offset);
+    if (aux) return aux;
     return (const char *)model_map + offset;
 }
 
 static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
-    if (g_model_device_owned || g_model_registered) return cuda_model_ptr(model_map, offset);
+    if ((model_map == g_model_host_base && (g_model_device_owned || g_model_registered)) ||
+        cuda_model_aux_ptr(model_map, 0) != NULL) {
+        return cuda_model_ptr(model_map, offset);
+    }
     if (g_model_hmm_direct &&
         getenv("DS4_CUDA_WEIGHT_CACHE") == NULL &&
         getenv("DS4_CUDA_WEIGHT_PRELOAD") == NULL) {
@@ -770,7 +809,10 @@ static const char *cuda_resolve_weight_ptr(const void *model_map,
 
 static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, uint64_t bytes) {
     if (bytes == 0) return 1;
-    if (g_model_device_owned || g_model_registered) return 1;
+    if ((model_map == g_model_host_base && (g_model_device_owned || g_model_registered)) ||
+        cuda_model_aux_ptr(model_map, 0) != NULL) {
+        return 1;
+    }
 
     const uint64_t end = offset + bytes;
     if (end < offset) return 0;
@@ -2318,6 +2360,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     if (g_model_registered && g_model_host_base) {
         (void)cudaHostUnregister((void *)g_model_host_base);
     }
+    cuda_model_aux_maps_release_all();
     g_model_host_base = NULL;
     g_model_device_base = NULL;
     g_model_registered_size = 0;
@@ -3143,6 +3186,7 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
         (void)cudaHostUnregister((void *)g_model_host_base);
         g_model_registered = 0;
     }
+    cuda_model_aux_maps_release_all();
     g_model_host_base = model_map;
     g_model_device_base = (const char *)model_map;
     g_model_registered_size = model_size;
@@ -3220,6 +3264,56 @@ extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model
 extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
+    for (uint32_t i = 0; i < g_model_aux_count; i++) {
+        if (g_model_aux_maps[i].host_base == model_map &&
+            g_model_aux_maps[i].size == model_size) {
+            return 1;
+        }
+    }
+    if (g_model_host_base != NULL) {
+        /* A second live model map (e.g. the DSpark support model). Register
+         * it in the auxiliary table instead of swapping the primary slot:
+         * base-model weights must keep resolving to device memory. If host
+         * registration fails here the map simply falls back to the fd/range
+         * cache (device copies), which is per-map keyed and safe. */
+        if (g_model_aux_count >= DS4_CUDA_MAX_AUX_MODEL_MAPS) {
+            fprintf(stderr,
+                    "ds4: CUDA (no-copy) auxiliary model map table is full; leaving %.2f GiB map to the fd/range cache\n",
+                    (double)model_size / 1073741824.0);
+            return 1;
+        }
+        const char *dev_ptr = NULL;
+        int registered = 0;
+        cudaError_t err = cudaHostRegister((void *)model_map, (size_t)model_size,
+                                           cudaHostRegisterMapped | cudaHostRegisterReadOnly);
+        if (err == cudaSuccess) {
+            void *dev = NULL;
+            err = cudaHostGetDevicePointer(&dev, (void *)model_map, 0);
+            if (err == cudaSuccess && dev) {
+                dev_ptr = (const char *)dev;
+                registered = 1;
+                fprintf(stderr,
+                        "ds4: CUDA (no-copy) registered %.2f GiB auxiliary model mapping for device access\n",
+                        (double)model_size / 1073741824.0);
+            } else {
+                fprintf(stderr,
+                        "ds4: CUDA (no-copy) auxiliary host registration pointer lookup failed: %s\n",
+                        cudaGetErrorString(err));
+                (void)cudaGetLastError();
+            }
+        } else {
+            fprintf(stderr,
+                    "ds4: CUDA (no-copy) auxiliary host registration skipped: %s\n",
+                    cudaGetErrorString(err));
+            (void)cudaGetLastError();
+        }
+        g_model_aux_maps[g_model_aux_count].host_base = model_map;
+        g_model_aux_maps[g_model_aux_count].device_base = dev_ptr;
+        g_model_aux_maps[g_model_aux_count].size = model_size;
+        g_model_aux_maps[g_model_aux_count].registered = registered;
+        g_model_aux_count++;
+        return 1;
+    }
 
     cuda_stream_selected_cache_release();
     cuda_model_range_release_all();
@@ -3240,6 +3334,7 @@ extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_
         (void)cudaHostUnregister((void *)g_model_host_base);
         g_model_registered = 0;
     }
+    cuda_model_aux_maps_release_all();
     g_model_host_base = model_map;
     g_model_device_base = (const char *)model_map;
     g_model_registered_size = model_size;
