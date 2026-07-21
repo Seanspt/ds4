@@ -51340,6 +51340,8 @@ static int ds4_session_eval_splitkv_spec_after_first(
  * 4. fall back to ordinary one-token decode if the fast verifier cannot prove
  *    the target stream. */
 
+const char *ds4_session_spec_suffix(const ds4_session *s);
+
 int ds4_engine_generate_argmax(
         ds4_engine        *e,
         const ds4_tokens  *prompt,
@@ -51411,9 +51413,10 @@ int ds4_engine_generate_argmax(
             if (done) done(emit_ud);
             ds4_log(stderr,
                     DS4_LOG_TIMING,
-                    "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
+                    "ds4: prefill: %.2f t/s, generation: %.2f t/s%s\n",
                     (t_prefill1 - t_prefill0) > 0.0 ? (double)prompt->len / (t_prefill1 - t_prefill0) : 0.0,
-                    (t_decode1 - t_decode0) > 0.0 ? (double)n_generated / (t_decode1 - t_decode0) : 0.0);
+                    (t_decode1 - t_decode0) > 0.0 ? (double)n_generated / (t_decode1 - t_decode0) : 0.0,
+                    ds4_session_spec_suffix(s));
             ds4_session_free(s);
             return rc;
         }
@@ -56445,6 +56448,38 @@ static bool ds4_dspark_stats_enabled(void) {
     return env && env[0] && strcmp(env, "0") != 0;
 }
 
+/*
+ * Returns a short suffix string with speculative-decode acceptance stats,
+ * or "" when no speculative decode was active during this session.
+ */
+const char *ds4_session_spec_suffix(const ds4_session *s) {
+    if (!s) return "";
+#ifndef DS4_NO_GPU
+    {
+        const ds4_dspark_spec_stats *st = &s->dspark_stats;
+        if (st->proposed_tokens > 0) {
+            static char buf[96];
+            const double rate = (100.0 * (double)st->accepted_draft_tokens /
+                                 (double)st->proposed_tokens);
+            const double avg = st->cycles
+                ? (double)st->accepted_draft_tokens / (double)st->cycles : 0.0;
+            snprintf(buf, sizeof(buf),
+                     " | spec accept %.1f%% avg %.2ftk", rate, avg);
+            return buf;
+        }
+    }
+#endif
+    if (s->mtp_probe_total > 0) {
+        static char buf[64];
+        snprintf(buf, sizeof(buf),
+                 " | mtp %llu/%llu hits",
+                 (unsigned long long)s->mtp_probe_hit,
+                 (unsigned long long)s->mtp_probe_total);
+        return buf;
+    }
+    return "";
+}
+
 static void ds4_format_len_hist(
         char           *buf,
         size_t          buflen,
@@ -60848,10 +60883,7 @@ static int ds4_session_eval_dspark_speculative_argmax(
 #define DS4_DSPARK_SCHED_EXTRA_MS()                                         \
     ((scheduler_enabled && stats_t0 != 0.0) ?                                \
      s->dspark_last_propose_ms + (now_sec() - stats_t0) * 1000.0 : 0.0)
-    if (stats_enabled) {
-        s->dspark_stats.cycles++;
-        if (n_accept > 0) s->dspark_stats.first_tokens++;
-    }
+    if (stats_enabled && n_accept > 0) s->dspark_stats.first_tokens++;
     if (spec_log) {
         fprintf(stderr,
                 "ds4: DSpark spec enter accepted=%d max=%d valid=%d len=%u pos=%d\n",
@@ -60916,8 +60948,9 @@ static int ds4_session_eval_dspark_speculative_argmax(
             return n_accept;
         }
     }
+    s->dspark_stats.proposed_tokens += (uint64_t)draft_n;
+    s->dspark_stats.cycles++;
     if (stats_enabled) {
-        s->dspark_stats.proposed_tokens += (uint64_t)draft_n;
         ds4_dspark_stats_note_len(s->dspark_stats.draft_len_hist,
                                   (uint32_t)draft_n);
     }
@@ -61037,9 +61070,9 @@ static int ds4_session_eval_dspark_speculative_argmax(
         }
         s->checkpoint_valid = true;
         ds4_session_dspark_capture_note_checkpoint(s);
+        s->dspark_stats.accepted_draft_tokens += (uint64_t)emitted_drafts;
         if (stats_enabled) {
             s->dspark_stats.full_accepts++;
-            s->dspark_stats.accepted_draft_tokens += (uint64_t)emitted_drafts;
             ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist,
                                       (uint32_t)emitted_drafts);
         }
@@ -61163,10 +61196,10 @@ static int ds4_session_eval_dspark_speculative_argmax(
         memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
         s->checkpoint_valid = true;
         ds4_session_dspark_capture_note_checkpoint(s);
+        s->dspark_stats.accepted_draft_tokens += (uint64_t)replayed_drafts;
         if (stats_enabled) {
             if (replayed_drafts == draft_n) s->dspark_stats.full_accepts++;
             else s->dspark_stats.partial_accepts++;
-            s->dspark_stats.accepted_draft_tokens += (uint64_t)replayed_drafts;
             ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist,
                                       (uint32_t)replayed_drafts);
         }
