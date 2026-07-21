@@ -114,8 +114,10 @@ static const char *cuda_model_aux_ptr(const void *model_map, uint64_t offset) {
 
 static void cuda_model_aux_maps_release_all(void) {
     for (uint32_t i = 0; i < g_model_aux_count; i++) {
-        if (g_model_aux_maps[i].registered && g_model_aux_maps[i].host_base) {
+        if (g_model_aux_maps[i].registered == 1 && g_model_aux_maps[i].host_base) {
             (void)cudaHostUnregister((void *)g_model_aux_maps[i].host_base);
+        } else if (g_model_aux_maps[i].registered == 2 && g_model_aux_maps[i].device_base) {
+            (void)cudaFree((void *)g_model_aux_maps[i].device_base);
         }
     }
     memset(g_model_aux_maps, 0, sizeof(g_model_aux_maps));
@@ -3283,29 +3285,60 @@ extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_
             return 1;
         }
         const char *dev_ptr = NULL;
-        int registered = 0;
-        cudaError_t err = cudaHostRegister((void *)model_map, (size_t)model_size,
-                                           cudaHostRegisterMapped | cudaHostRegisterReadOnly);
+        int registered = 0; /* 1 = zero-copy host registration, 2 = device-owned copy */
+        /* Prefer a full device copy: draft-weight reads then hit device
+         * memory. Zero-copy host registration makes every MoE expert read
+         * stream over PCIe on each draft, which measured ~10x slower on a
+         * discrete GPU. */
+        void *dev_copy = NULL;
+        cudaError_t err = cudaMalloc(&dev_copy, (size_t)model_size);
         if (err == cudaSuccess) {
-            void *dev = NULL;
-            err = cudaHostGetDevicePointer(&dev, (void *)model_map, 0);
-            if (err == cudaSuccess && dev) {
-                dev_ptr = (const char *)dev;
-                registered = 1;
+            const double copy_t0 = cuda_wall_sec();
+            err = cudaMemcpy(dev_copy, model_map, (size_t)model_size, cudaMemcpyHostToDevice);
+            if (err == cudaSuccess) {
+                dev_ptr = (const char *)dev_copy;
+                registered = 2;
                 fprintf(stderr,
-                        "ds4: CUDA (no-copy) registered %.2f GiB auxiliary model mapping for device access\n",
-                        (double)model_size / 1073741824.0);
+                        "ds4: CUDA copied %.2f GiB auxiliary model mapping to device memory in %.2fs\n",
+                        (double)model_size / 1073741824.0,
+                        cuda_wall_sec() - copy_t0);
             } else {
                 fprintf(stderr,
-                        "ds4: CUDA (no-copy) auxiliary host registration pointer lookup failed: %s\n",
+                        "ds4: CUDA auxiliary model device copy failed: %s\n",
                         cudaGetErrorString(err));
+                (void)cudaFree(dev_copy);
                 (void)cudaGetLastError();
             }
         } else {
             fprintf(stderr,
-                    "ds4: CUDA (no-copy) auxiliary host registration skipped: %s\n",
+                    "ds4: CUDA auxiliary model device alloc skipped: %s\n",
                     cudaGetErrorString(err));
             (void)cudaGetLastError();
+        }
+        if (!dev_ptr) {
+            err = cudaHostRegister((void *)model_map, (size_t)model_size,
+                                   cudaHostRegisterMapped | cudaHostRegisterReadOnly);
+            if (err == cudaSuccess) {
+                void *dev = NULL;
+                err = cudaHostGetDevicePointer(&dev, (void *)model_map, 0);
+                if (err == cudaSuccess && dev) {
+                    dev_ptr = (const char *)dev;
+                    registered = 1;
+                    fprintf(stderr,
+                            "ds4: CUDA (no-copy) registered %.2f GiB auxiliary model mapping for device access\n",
+                            (double)model_size / 1073741824.0);
+                } else {
+                    fprintf(stderr,
+                            "ds4: CUDA (no-copy) auxiliary host registration pointer lookup failed: %s\n",
+                            cudaGetErrorString(err));
+                    (void)cudaGetLastError();
+                }
+            } else {
+                fprintf(stderr,
+                        "ds4: CUDA (no-copy) auxiliary host registration skipped: %s\n",
+                        cudaGetErrorString(err));
+                (void)cudaGetLastError();
+            }
         }
         g_model_aux_maps[g_model_aux_count].host_base = model_map;
         g_model_aux_maps[g_model_aux_count].device_base = dev_ptr;
