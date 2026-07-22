@@ -159,6 +159,34 @@ the final-hop worker (the node with `--layers N:output` covering the target
 layers), never on the coordinator. See "Distributed DSpark Speculative
 Decoding" in the top-level README.
 
+### High-Precision Draft Experiments
+
+The default draft quantizes routed experts aggressively (IQ2_XXS / Q2_K).
+To measure how much draft precision affects the acceptance rate, rebuild the
+support GGUF with the `--dspark-precision` preset (explicit per-category type
+flags such as `--routed-w1` override the preset):
+
+```sh
+# q8: routed + shared experts q8_0, attention/dense f16 (~20 GiB output)
+gguf-tools/deepseek4-quantize \
+  --hf ../deepseek-v4-quants/hf/DeepSeek-V4-Flash-DSpark \
+  --dspark-support --dspark-precision q8 \
+  --out DeepSeek-V4-Flash-DSpark-support-q8.gguf
+
+# q4: routed experts q4_K, shared q8_0, attention/dense f16 (~11 GiB output)
+gguf-tools/deepseek4-quantize \
+  --hf ../deepseek-v4-quants/hf/DeepSeek-V4-Flash-DSpark \
+  --dspark-support --dspark-precision q4 \
+  --out DeepSeek-V4-Flash-DSpark-support-q4.gguf
+```
+
+Runtime constraints: routed experts support only quantized types
+(Q8_0/IQ2_XXS/Q2_K/Q4_K/Q5_K/Q6_K) — F16/BF16 routed experts are rejected by
+the DSpark loader, so `q8` is the closest to original precision the runtime
+accepts. Dense/plain tensors may be F16/F32. Mind worker VRAM: the q8 build
+is ~20 GiB and the draft model is kept device-resident on CUDA, so a 32 GB
+card holding a ~11 GiB base slice is tight; q4 is comfortable.
+
 Before a full write, regenerate one support tensor and record its checksum:
 
 ```sh

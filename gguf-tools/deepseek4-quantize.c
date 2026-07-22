@@ -1737,6 +1737,7 @@ typedef struct {
     uint32_t noise_token_id;
     uint32_t target_layers[DSPARK_MAX_TARGET_LAYERS];
     uint32_t target_layer_count;
+    ds4q_type precision_routed;
 } dspark_support_options;
 
 static void dspark_support_defaults(dspark_support_options *o) {
@@ -1748,6 +1749,7 @@ static void dspark_support_defaults(dspark_support_options *o) {
     o->target_layers[1] = 41;
     o->target_layers[2] = 42;
     o->target_layer_count = 3;
+    o->precision_routed = DS4Q_TYPE_COUNT;
 }
 
 typedef struct {
@@ -2473,6 +2475,7 @@ static void usage(const char *argv0) {
     printf("  --dspark-markov-rank N DSpark Markov rank metadata, default 256\n");
     printf("  --dspark-noise-token-id N  DSpark noise token id metadata, default 128799\n");
     printf("  --dspark-target-layers CSV DSpark target layer ids metadata, default 40,41,42\n");
+    printf("  --dspark-precision q4|q8  high-precision draft preset: q8 = routed/shared q8_0 + f16 dense (~20 GiB), q4 = routed q4_K + q8_0 shared + f16 dense (~11 GiB); explicit type flags override the preset\n");
     printf("  --imatrix FILE         legacy .dat imatrix from ds4 --imatrix-out\n");
     printf("  --imatrix-strict       fail if a quantized tensor has no matching imatrix vector\n");
     printf("  --experts TYPE         set routed w1/w2/w3 expert tensors to TYPE\n");
@@ -2582,6 +2585,15 @@ static params parse_args(int argc, char **argv) {
             p.dspark.noise_token_id = parse_u32_arg(need_value(argc, argv, &i, arg), arg);
         } else if (strcmp(arg, "--dspark-target-layers") == 0) {
             parse_dspark_target_layers_arg(&p.dspark, need_value(argc, argv, &i, arg), arg);
+        } else if (strcmp(arg, "--dspark-precision") == 0) {
+            const char *v = need_value(argc, argv, &i, arg);
+            if (strcmp(v, "q8") == 0) {
+                p.dspark.precision_routed = DS4Q_TYPE_Q8_0;
+            } else if (strcmp(v, "q4") == 0) {
+                p.dspark.precision_routed = DS4Q_TYPE_Q4_K;
+            } else {
+                die("--dspark-precision expects q4 or q8");
+            }
         } else if (strcmp(arg, "--imatrix") == 0) {
             p.imatrix_file = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--imatrix-strict") == 0) {
@@ -2627,6 +2639,18 @@ static params parse_args(int argc, char **argv) {
     if (p.dspark_manifest && p.dspark_support) die("--dspark-manifest and --dspark-support are mutually exclusive");
     if (p.dspark_manifest) return p;
     if (p.dspark_support) {
+        /* High-precision draft preset: fills only the policy slots the user
+         * did not set explicitly, so the per-category type flags still win. */
+        if (p.dspark.precision_routed != DS4Q_TYPE_COUNT) {
+            const ds4q_type rt = p.dspark.precision_routed;
+            if (p.policy.routed_w1 == DS4Q_TYPE_COUNT) p.policy.routed_w1 = rt;
+            if (p.policy.routed_w2 == DS4Q_TYPE_COUNT) p.policy.routed_w2 = rt;
+            if (p.policy.routed_w3 == DS4Q_TYPE_COUNT) p.policy.routed_w3 = rt;
+            if (p.policy.shared == DS4Q_TYPE_COUNT) p.policy.shared = DS4Q_TYPE_Q8_0;
+            if (p.policy.attention_proj == DS4Q_TYPE_COUNT) p.policy.attention_proj = DS4Q_TYPE_F16;
+            if (p.policy.attention == DS4Q_TYPE_COUNT) p.policy.attention = DS4Q_TYPE_F16;
+            if (p.policy.dense == DS4Q_TYPE_COUNT) p.policy.dense = DS4Q_TYPE_F16;
+        }
         if (!p.dry_run && !p.compare_tensor && !p.out_gguf) {
             die("--out is required unless --dry-run or --compare-tensor is used");
         }
