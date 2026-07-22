@@ -1738,6 +1738,7 @@ typedef struct {
     uint32_t target_layers[DSPARK_MAX_TARGET_LAYERS];
     uint32_t target_layer_count;
     ds4q_type precision_routed;
+    bool precision_original;
 } dspark_support_options;
 
 static void dspark_support_defaults(dspark_support_options *o) {
@@ -2082,6 +2083,26 @@ static ds4q_type dspark_default_type(const tensor_meta *t, dspark_tensor_role ro
     return DS4Q_TYPE_F16;
 }
 
+/* "Official precision": map each tensor's HF storage dtype to the closest
+ * GGUF type the runtime accepts. The official checkpoint stores routed
+ * experts as packed FP4 (I8 nibbles + block scales) and most other weights
+ * as FP8; the runtime has no FP4 type, so FP4 becomes Q4_K (its closest
+ * ~4-bit routed type) and FP8 becomes Q8_0. Routed experts must stay on the
+ * routed-expert type whitelist. */
+static ds4q_type dspark_type_from_hf_dtype(const char *dtype,
+                                           dspark_tensor_role role) {
+    if (role == DSPARK_ROLE_F32) return DS4Q_TYPE_F32;
+    if (role == DSPARK_ROLE_PLAIN) return DS4Q_TYPE_F16;
+    if (dtype && strcmp(dtype, "I8") == 0) return DS4Q_TYPE_Q4_K;
+    if (dtype &&
+        (strcmp(dtype, "F8_E4M3") == 0 || strcmp(dtype, "F8_E5M2") == 0)) {
+        return DS4Q_TYPE_Q8_0;
+    }
+    if (role == DSPARK_ROLE_ROUTED) return DS4Q_TYPE_Q8_0;
+    if (dtype && strcmp(dtype, "F32") == 0) return DS4Q_TYPE_F32;
+    return DS4Q_TYPE_F16;
+}
+
 static ds4q_type dspark_policy_type(const quant_policy *p, const char *name,
                                     const tensor_meta *t, dspark_tensor_role role,
                                     expert_part part) {
@@ -2150,6 +2171,7 @@ static void dspark_plan_set_size(dspark_tensor_plan *tp) {
 static void dspark_plan_add_regular(dspark_support_plan *plan,
                                     st_db *db,
                                     const quant_policy *policy,
+                                    const dspark_support_options *opt,
                                     const char *hf_name,
                                     const char *gguf_name,
                                     int stage) {
@@ -2163,13 +2185,16 @@ static void dspark_plan_add_regular(dspark_support_plan *plan,
     tp->meta.name = xstrdup(gguf_name);
     dspark_shape_reversed_from_info(&tp->meta, &te->info);
     tp->role = dspark_tensor_role_for_name(gguf_name);
-    tp->meta.type = dspark_policy_type(policy, gguf_name, &tp->meta, tp->role, EXP_NONE);
+    tp->meta.type = opt->precision_original
+        ? dspark_type_from_hf_dtype(te->info.dtype, tp->role)
+        : dspark_policy_type(policy, gguf_name, &tp->meta, tp->role, EXP_NONE);
     dspark_plan_set_size(tp);
 }
 
 static void dspark_plan_add_expert(dspark_support_plan *plan,
                                    st_db *db,
                                    const quant_policy *policy,
+                                   const dspark_support_options *opt,
                                    const char *hf_name,
                                    const char *gguf_name,
                                    int stage,
@@ -2203,7 +2228,9 @@ static void dspark_plan_add_expert(dspark_support_plan *plan,
         tp->meta.ne[1] = nrows;
         tp->meta.ne[2] = 0;
         tp->role = DSPARK_ROLE_ROUTED;
-        tp->meta.type = dspark_policy_type(policy, gguf_name, &tp->meta, tp->role, part);
+        tp->meta.type = opt->precision_original
+            ? dspark_type_from_hf_dtype(te->info.dtype, tp->role)
+            : dspark_policy_type(policy, gguf_name, &tp->meta, tp->role, part);
     }
     if (expert + 1 > tp->n_experts) tp->n_experts = expert + 1;
     if (stage + 1 > plan->stages) plan->stages = stage + 1;
@@ -2285,7 +2312,6 @@ static dspark_support_plan build_dspark_support_plan(st_db *db,
                                                      const quant_policy *policy,
                                                      const dspark_support_options *opt,
                                                      int requested_n_experts) {
-    (void)opt;
     dspark_support_plan plan = {0};
     str_list names = load_index_weight_names(db->hf_dir);
     uint64_t unknown = 0;
@@ -2300,7 +2326,7 @@ static dspark_support_plan build_dspark_support_plan(st_db *db,
         const char *action = NULL;
         char *gguf = map_dspark_hf_name(hf, &action);
         if (strcmp(action, "emit") == 0) {
-            dspark_plan_add_regular(&plan, db, policy, hf, gguf, stage);
+            dspark_plan_add_regular(&plan, db, policy, opt, hf, gguf, stage);
         } else if (strcmp(action, "pack_expert") == 0) {
             int expert = -1;
             expert_part part = EXP_NONE;
@@ -2308,7 +2334,7 @@ static dspark_support_plan build_dspark_support_plan(st_db *db,
             if (!parse_dspark_hf_expert(hf, &stage, &expert, &part, &is_scale) || is_scale) {
                 die("bad DSpark expert manifest mapping");
             }
-            dspark_plan_add_expert(&plan, db, policy, hf, gguf, stage, expert, part);
+            dspark_plan_add_expert(&plan, db, policy, opt, hf, gguf, stage, expert, part);
         } else if (strcmp(action, "unknown_dspark") == 0) {
             unknown++;
         }
@@ -2475,7 +2501,7 @@ static void usage(const char *argv0) {
     printf("  --dspark-markov-rank N DSpark Markov rank metadata, default 256\n");
     printf("  --dspark-noise-token-id N  DSpark noise token id metadata, default 128799\n");
     printf("  --dspark-target-layers CSV DSpark target layer ids metadata, default 40,41,42\n");
-    printf("  --dspark-precision q4|q8  high-precision draft preset: q8 = routed/shared q8_0 + f16 dense (~20 GiB), q4 = routed q4_K + q8_0 shared + f16 dense (~11 GiB); explicit type flags override the preset\n");
+    printf("  --dspark-precision q4|q8|original  draft precision preset: original = keep each tensor's HF storage dtype mapped to the closest runtime type (FP4->q4_K, FP8->q8_0), q8 = routed/shared q8_0 + f16 dense, q4 = routed q4_K + q8_0 shared + f16 dense; explicit type flags override q4/q8\n");
     printf("  --imatrix FILE         legacy .dat imatrix from ds4 --imatrix-out\n");
     printf("  --imatrix-strict       fail if a quantized tensor has no matching imatrix vector\n");
     printf("  --experts TYPE         set routed w1/w2/w3 expert tensors to TYPE\n");
@@ -2591,8 +2617,10 @@ static params parse_args(int argc, char **argv) {
                 p.dspark.precision_routed = DS4Q_TYPE_Q8_0;
             } else if (strcmp(v, "q4") == 0) {
                 p.dspark.precision_routed = DS4Q_TYPE_Q4_K;
+            } else if (strcmp(v, "original") == 0) {
+                p.dspark.precision_original = true;
             } else {
-                die("--dspark-precision expects q4 or q8");
+                die("--dspark-precision expects q4, q8 or original");
             }
         } else if (strcmp(arg, "--imatrix") == 0) {
             p.imatrix_file = need_value(argc, argv, &i, arg);
@@ -2639,6 +2667,9 @@ static params parse_args(int argc, char **argv) {
     if (p.dspark_manifest && p.dspark_support) die("--dspark-manifest and --dspark-support are mutually exclusive");
     if (p.dspark_manifest) return p;
     if (p.dspark_support) {
+        if (p.dspark.precision_original && p.dspark.precision_routed != DS4Q_TYPE_COUNT) {
+            die("--dspark-precision takes only one of q4, q8, original");
+        }
         /* High-precision draft preset: fills only the policy slots the user
          * did not set explicitly, so the per-category type flags still win. */
         if (p.dspark.precision_routed != DS4Q_TYPE_COUNT) {

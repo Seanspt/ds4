@@ -167,6 +167,15 @@ support GGUF with the `--dspark-precision` preset (explicit per-category type
 flags such as `--routed-w1` override the preset):
 
 ```sh
+# original: keep the official checkpoint's storage precision — FP4 experts
+# become q4_K (the closest routed type the runtime has), FP8 becomes q8_0,
+# F16/BF16 stays f16. This is the closest runnable match to the official
+# ~7 GiB draft (expect ~10-12 GiB: the runtime has no FP4 tensor type).
+gguf-tools/deepseek4-quantize \
+  --hf ../deepseek-v4-quants/hf/DeepSeek-V4-Flash-DSpark \
+  --dspark-support --dspark-precision original \
+  --out DeepSeek-V4-Flash-DSpark-support-original.gguf
+
 # q8: routed + shared experts q8_0, attention/dense f16 (~20 GiB output)
 gguf-tools/deepseek4-quantize \
   --hf ../deepseek-v4-quants/hf/DeepSeek-V4-Flash-DSpark \
