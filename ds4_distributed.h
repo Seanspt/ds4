@@ -44,6 +44,14 @@ bool ds4_dist_enabled(const ds4_dist_options *opt);
 ds4_dist_options *ds4_dist_options_create(void);
 void ds4_dist_options_free(ds4_dist_options *opt);
 void ds4_dist_usage(FILE *fp);
+
+/* FNV-1a over little-endian token IDs: the session prefix invariant used by
+ * the distributed WORK frames. Exported so the hidden-export channel
+ * (ds4_hsexport.c) computes identical prefix hashes; not a security
+ * primitive. */
+#define DS4_DIST_TOKEN_HASH_INIT 1469598103934665603ull
+uint64_t ds4_dist_token_hash_update_span(uint64_t h, const int *tokens,
+                                         uint32_t n_tokens);
 ds4_dist_cli_parse_result ds4_dist_parse_cli_arg(
         const char *arg,
         int *index,

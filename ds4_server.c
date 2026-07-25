@@ -2,6 +2,7 @@
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
+#include "ds4_hsexport.h"
 #include "ds4_kvstore.h"
 #include "rax.h"
 
@@ -8297,6 +8298,11 @@ struct server {
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
+    /* Hidden-state export (HIDDEN_EXPORT.md): NULL unless --hidden-export-*
+     * was given. Non-batched mode only; startup rejects the combination. */
+    ds4_hsexport *exporter;
+    int export_layers[DS4_HSEXPORT_MAX_LAYERS];
+    int export_n_layers;
 };
 
 /* Jobs are stack-owned by the client thread.  A resident-slot worker signals
@@ -10121,6 +10127,10 @@ static int chat_think_tool_recovery(server *s,
             ds4_tokens_free(&toks);
             return -1;
         }
+        if (s->exporter) {
+            ds4_hsexport_emit(s->exporter, s->session,
+                              (uint32_t)(ds4_session_pos(s->session) - 1), 1);
+        }
         (*completion)++;
     }
     buf_append(text, inject, inject_len);
@@ -10302,7 +10312,39 @@ static int server_session_sync(server *s, server_slot *slot,
     if (!s || !slot || !prompt) return 1;
     if (!s->batched_mode) {
         if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
-        int rc = ds4_session_sync(slot->session, prompt, err, errlen);
+        int rc;
+        if (!s->exporter) {
+            rc = ds4_session_sync(slot->session, prompt, err, errlen);
+        } else {
+            /* Hidden export: advance one engine prefill chunk per sync so the
+             * rows of every internal eval are emitted exactly once (a tap
+             * holds only the rows of the most recent eval). */
+            const int chunk = (int)ds4_engine_prefill_chunk(s->engine);
+            const int live = ds4_session_pos(slot->session);
+            const int common = ds4_session_common_prefix(slot->session, prompt);
+            int done = (common == live && prompt->len >= live) ? live : 0;
+            rc = 0;
+            while (rc == 0 && done < prompt->len) {
+                int target = done + chunk;
+                if (target > prompt->len || target < done) target = prompt->len;
+                ds4_tokens prefix = *prompt;
+                prefix.len = target;
+                /* Rows evaluated by this sync start at the common frontier
+                 * (a rebuild truncates back to it first). */
+                const int start = ds4_session_common_prefix(slot->session, &prefix);
+                rc = ds4_session_sync(slot->session, &prefix, err, errlen);
+                if (rc != 0) break;
+                done = ds4_session_pos(slot->session);
+                if (done > start) {
+                    ds4_hsexport_emit(s->exporter, slot->session,
+                                      (uint32_t)start, (uint32_t)(done - start));
+                }
+                if (done < target) {
+                    if (err && errlen) snprintf(err, errlen, "prefill made no progress");
+                    rc = 1;
+                }
+            }
+        }
         server_prefill_leave(s);
         return rc;
     }
@@ -10811,6 +10853,10 @@ static int server_eval_token(server *s, server_slot *slot, int token,
     if (!s->batched_mode) {
         pthread_mutex_lock(&s->inference_mu);
         int rc = ds4_session_eval(slot->session, token, err, errlen);
+        if (rc == 0 && s->exporter) {
+            ds4_hsexport_emit(s->exporter, slot->session,
+                              (uint32_t)(ds4_session_pos(slot->session) - 1), 1);
+        }
         pthread_mutex_unlock(&s->inference_mu);
         return rc;
     }
@@ -12529,6 +12575,10 @@ typedef struct {
     int tool_memory_max_ids;
     bool enable_cors;
     int batched_sessions;
+    const char *hidden_export_host;
+    int hidden_export_port;
+    const char *hidden_export_layers;
+    const char *hidden_export_format;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -12595,6 +12645,10 @@ static void log_context_memory(ds4_backend backend, int ctx_size,
     }
 }
 static void server_close_resources(server *s) {
+    if (s->exporter) {
+        ds4_hsexport_stop(s->exporter);
+        s->exporter = NULL;
+    }
     if (s->trace) {
         fclose(s->trace);
         s->trace = NULL;
@@ -12739,6 +12793,13 @@ static server_config parse_options(int argc, char **argv) {
             c.batched_sessions = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-disk-dir")) {
             c.kv_disk_dir = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--hidden-export-listen")) {
+            c.hidden_export_host = need_arg(&i, argc, argv, arg);
+            c.hidden_export_port = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--hidden-export-layers")) {
+            c.hidden_export_layers = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--hidden-export-format")) {
+            c.hidden_export_format = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--kv-disk-space-mb")) {
             c.kv_disk_space_mb = (uint64_t)parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-cache-min-tokens")) {
@@ -12849,6 +12910,40 @@ static server_config parse_options(int argc, char **argv) {
                    "ds4-server: --kv-cache-cold-max-tokens must be 0 or >= --kv-cache-min-tokens");
         exit(2);
     }
+    if (c.hidden_export_host || c.hidden_export_layers || c.hidden_export_format) {
+        /* Hidden-state export (Phase 1) assumes a single append-only session:
+         * refuse combinations whose eval paths the exporter cannot follow. */
+        if (!c.hidden_export_host || !c.hidden_export_layers) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: hidden export requires --hidden-export-listen HOST PORT and --hidden-export-layers CSV");
+            exit(2);
+        }
+        if (c.hidden_export_format &&
+            strcmp(c.hidden_export_format, "f32") &&
+            strcmp(c.hidden_export_format, "f16")) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: --hidden-export-format must be f32 or f16");
+            exit(2);
+        }
+        int probe[DS4_HSEXPORT_MAX_LAYERS];
+        if (ds4_hsexport_parse_layers(c.hidden_export_layers,
+                                      probe, DS4_HSEXPORT_MAX_LAYERS) < 0) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: --hidden-export-layers must be 1..%d comma-separated layer ids",
+                       DS4_HSEXPORT_MAX_LAYERS);
+            exit(2);
+        }
+        if (c.batched_sessions > 0) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: hidden export is not supported with --batched-session");
+            exit(2);
+        }
+        if (c.engine.mtp_path || c.engine.dspark || c.engine.glm_mtp) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: hidden export is not supported with speculative decoding (--mtp/--dspark/--glm-mtp)");
+            exit(2);
+        }
+    }
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
     }
@@ -12858,6 +12953,11 @@ static server_config parse_options(int argc, char **argv) {
                                         dist_err,
                                         sizeof(dist_err)) != 0) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: %s", dist_err);
+        exit(2);
+    }
+    if (c.engine.distributed.role == DS4_DISTRIBUTED_TRAIN_SINK) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: --role train-sink is a ds4 role, not a server role");
         exit(2);
     }
     return c;
@@ -12990,6 +13090,35 @@ int main(int argc, char **argv) {
         }
     }
     s.session = s.slots[0].session;
+
+    if (cfg.hidden_export_host) {
+        s.export_n_layers = ds4_hsexport_parse_layers(cfg.hidden_export_layers,
+                                                      s.export_layers,
+                                                      DS4_HSEXPORT_MAX_LAYERS);
+        ds4_hsexport_options xopt = {
+            .host = cfg.hidden_export_host,
+            .port = cfg.hidden_export_port,
+            .bits = (cfg.hidden_export_format &&
+                     !strcmp(cfg.hidden_export_format, "f16")) ? 16 : 32,
+        };
+        char xerr[256];
+        s.exporter = ds4_hsexport_start(engine, &xopt, xerr, sizeof(xerr));
+        if (!s.exporter) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: hidden export failed to start: %s", xerr);
+            server_close_resources(&s);
+            return 1;
+        }
+        for (int i = 0; i < slot_count; i++) {
+            if (ds4_hsexport_attach(s.exporter, s.slots[i].session,
+                                    (uint64_t)s.slots[i].id + 1,
+                                    s.export_layers, s.export_n_layers,
+                                    xerr, sizeof(xerr)) != 0) {
+                server_log(DS4_LOG_DEFAULT, "ds4-server: hidden export attach failed: %s", xerr);
+                server_close_resources(&s);
+                return 1;
+            }
+        }
+    }
 
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,

@@ -2482,6 +2482,62 @@ static void print_size(uint64_t bytes) {
 #define DS4_DSPARK_MAX_STAGES 8
 #define DS4_DSPARK_MAX_BLOCK_SIZE 16
 
+/* Hidden-state tap table (HIDDEN_EXPORT.md M2). A session may tap an
+ * arbitrary set of layer outputs; each eval mirrors the tapped rows into
+ * session-owned host buffers. Independent of the DSpark capture, which keeps
+ * its own target set and KV-seeding duties. */
+#define DS4_MAX_TAP_LAYERS 8
+
+/* Host-side view of a session's tap configuration, passed into the CPU
+ * reference forward paths (the session struct is declared much later in this
+ * file). host[i] holds host_cap rows; the row width is hc_dim f32 for
+ * DS4_TAP_FORMAT_RAW_HC, n_embd f32 for DS4_TAP_FORMAT_MEAN_HC. */
+typedef struct {
+    const int *layers;
+    int count;
+    int format;
+    float *const *host;
+    uint32_t host_cap;
+    uint32_t *rows_out; /* most recent eval row count; may be NULL */
+} ds4_tap_host_cfg;
+
+/* Copy the finished layer-il hidden row(s) into the tap host buffers.
+ * cur points at the layer output: one hc_dim row for decode, n_rows rows for
+ * prefill. MEAN_HC folds the n_hc sub-vectors on the host. Row counts beyond
+ * host_cap are truncated: the GPU prefill path chunks by prefill_cap, the CPU
+ * reference path may see longer spans. */
+static void cpu_tap_capture_rows(const ds4_tap_host_cfg *tap,
+                                 uint32_t il,
+                                 const float *cur,
+                                 uint32_t n_rows) {
+    if (!tap || tap->count <= 0 || !cur || n_rows == 0) return;
+    if (n_rows > tap->host_cap) n_rows = tap->host_cap;
+    const uint32_t n_embd = DS4_N_EMBD;
+    const uint32_t n_hc = DS4_N_HC;
+    const uint64_t hc_dim = (uint64_t)n_hc * n_embd;
+    for (int i = 0; i < tap->count; i++) {
+        if ((uint32_t)tap->layers[i] != il || !tap->host[i]) continue;
+        float *dst = tap->host[i];
+        if (tap->format == DS4_TAP_FORMAT_MEAN_HC) {
+            const float inv_hc = n_hc ? 1.0f / (float)n_hc : 0.0f;
+            for (uint32_t r = 0; r < n_rows; r++) {
+                const float *src = cur + (uint64_t)r * hc_dim;
+                float *out = dst + (uint64_t)r * n_embd;
+                for (uint32_t j = 0; j < n_embd; j++) {
+                    float sum = 0.0f;
+                    for (uint32_t h = 0; h < n_hc; h++) {
+                        sum += src[(uint64_t)h * n_embd + j];
+                    }
+                    out[j] = sum * inv_hc;
+                }
+            }
+        } else {
+            memcpy(dst, cur, (size_t)n_rows * hc_dim * sizeof(float));
+        }
+    }
+    if (tap->rows_out) *tap->rows_out = n_rows;
+}
+
 typedef struct {
     uint32_t stages;
     uint32_t block_size;
@@ -13586,7 +13642,8 @@ static void output_logits_one_decode_scratch(
         ds4_cpu_decode_scratch * scratch);
 
 /* CPU decode for one token through all 43 layers.  The caller owns scratch and
- * cache lifetimes so no per-token allocations are needed. */
+ * cache lifetimes so no per-token allocations are needed.  tap is NULL unless
+ * the session configured hidden taps (HIDDEN_EXPORT.md). */
 static void forward_token_raw_swa_cpu_decode_scratch(
         float             * logits,
         const ds4_model   * model,
@@ -13597,7 +13654,8 @@ static void forward_token_raw_swa_cpu_decode_scratch(
         const float       * steering_dirs,
         float               steering_attn_scale,
         float               steering_ffn_scale,
-        ds4_cpu_decode_scratch * scratch) {
+        ds4_cpu_decode_scratch * scratch,
+        const ds4_tap_host_cfg * tap) {
     float *cur = scratch->cur;
     float *next = scratch->next;
 
@@ -13614,6 +13672,7 @@ static void forward_token_raw_swa_cpu_decode_scratch(
         float *tmp = cur;
         cur = next;
         next = tmp;
+        if (tap) cpu_tap_capture_rows(tap, il, cur, 1);
     }
 
     if (logits) {
@@ -13640,13 +13699,14 @@ static void forward_token_raw_swa_cpu(
     }
     cpu_decode_scratch_init(&scratch, ctx_guess);
     forward_token_raw_swa_cpu_decode_scratch(logits, model, weights, cache, token, pos,
-                                             NULL, 0.0f, 0.0f, &scratch);
+                                             NULL, 0.0f, 0.0f, &scratch, NULL);
     cpu_decode_scratch_free(&scratch);
 }
 #endif
 
 /* CPU prefill in layer-major order.  All prompt tokens pass through layer 0,
- * then layer 1, etc., which exposes batch matmul opportunities. */
+ * then layer 1, etc., which exposes batch matmul opportunities.  tap is NULL
+ * unless the session configured hidden taps (HIDDEN_EXPORT.md). */
 static void prefill_layer_major_cpu(
         float             * logits,
         const ds4_model   * model,
@@ -13655,7 +13715,8 @@ static void prefill_layer_major_cpu(
         const token_vec   * prompt,
         const float       * steering_dirs,
         float               steering_attn_scale,
-        float               steering_ffn_scale) {
+        float               steering_ffn_scale,
+        const ds4_tap_host_cfg * tap) {
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t n_tok = (uint64_t)prompt->len;
     float *cur = xmalloc((size_t)n_tok * hc_dim * sizeof(cur[0]));
@@ -13793,6 +13854,7 @@ static void prefill_layer_major_cpu(
         float *tmp = cur;
         cur = next;
         next = tmp;
+        if (tap) cpu_tap_capture_rows(tap, il, cur, (uint32_t)n_tok);
     }
 
     kv_cache_finish_prefill_states(cache, (uint32_t)n_tok);
@@ -15014,6 +15076,23 @@ typedef struct {
     uint32_t pipeline_capture_chunk_len;
     bool ssd_streaming; /* glm-branch SSD streaming; always false here */
 
+    /* Generic hidden-state tap table (HIDDEN_EXPORT.md M2). Arbitrary layer
+     * set, configured per session via ds4_session_set_hidden_taps; captured
+     * rows are mirrored to session-owned host buffers after each eval.
+     * tap_count == 0 short-circuits every hook, so an unconfigured graph
+     * pays nothing. tap_host / tap_rows_out are borrowed session pointers;
+     * the session outlives its embedded graph. */
+    uint32_t tap_layers[DS4_MAX_TAP_LAYERS];
+    uint32_t tap_count;
+    int tap_format;                     /* DS4_TAP_FORMAT_* */
+    ds4_gpu_tensor *tap_hidden;         /* decode rows: tap_count * row f32 */
+    ds4_gpu_tensor *tap_hidden_batch;   /* prefill: tap_count * prefill_cap rows */
+    ds4_gpu_tensor *tap_hc_mean_weights;/* MEAN_HC only: 1/n_hc vector */
+    ds4_gpu_tensor *tap_hc_mean_rows;   /* MEAN_HC only: prefill_cap * n_hc */
+    float **tap_host;
+    uint32_t tap_host_cap;
+    uint32_t *tap_rows_out;
+
     /* Optional MTP model state.  It has its own raw cache because the drafter
      * runs on speculative future tokens; target KV state is updated only after
      * verification accepts draft tokens. */
@@ -15739,6 +15818,10 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->dspark_target_hidden);
     ds4_gpu_tensor_free(g->dspark_hc_mean_rows);
     ds4_gpu_tensor_free(g->dspark_hc_mean_weights);
+    ds4_gpu_tensor_free(g->tap_hc_mean_rows);
+    ds4_gpu_tensor_free(g->tap_hc_mean_weights);
+    ds4_gpu_tensor_free(g->tap_hidden_batch);
+    ds4_gpu_tensor_free(g->tap_hidden);
     ds4_gpu_tensor_free(g->tp_logits_half);
     free(g->cpu_router_norm);
     memset(g, 0, sizeof(*g));
@@ -15965,6 +16048,107 @@ static bool metal_graph_configure_dspark_capture(
     g->dspark_capture_valid = false;
     g->dspark_capture_batch_valid = false;
     g->dspark_capture_enabled = true;
+    return true;
+}
+
+static void metal_graph_tap_clear(ds4_gpu_graph *g) {
+    if (!g) return;
+    ds4_gpu_tensor_free(g->tap_hc_mean_rows);
+    ds4_gpu_tensor_free(g->tap_hc_mean_weights);
+    ds4_gpu_tensor_free(g->tap_hidden_batch);
+    ds4_gpu_tensor_free(g->tap_hidden);
+    g->tap_hc_mean_rows = NULL;
+    g->tap_hc_mean_weights = NULL;
+    g->tap_hidden_batch = NULL;
+    g->tap_hidden = NULL;
+    g->tap_count = 0;
+    g->tap_format = DS4_TAP_FORMAT_RAW_HC;
+    g->tap_host = NULL;
+    g->tap_host_cap = 0;
+    g->tap_rows_out = NULL;
+}
+
+/* (Re)configure the graph-side half of the session tap set: per-tap decode
+ * and prefill capture buffers, sized like the DSpark target-hidden tensors
+ * but with the row width selected by the tap format. The host row buffers
+ * stay session-owned; the graph only borrows the pointer array so the eval
+ * paths can read captured rows back without seeing the session struct. */
+static bool metal_graph_configure_taps(
+        ds4_gpu_graph *g,
+        const int     *layers,
+        uint32_t       count,
+        int            format,
+        float        **host,
+        uint32_t       host_cap,
+        uint32_t      *rows_out) {
+    if (!g) return false;
+    metal_graph_tap_clear(g);
+    if (count == 0) return true;
+    if (!layers || !host || host_cap == 0 ||
+        count > DS4_MAX_TAP_LAYERS ||
+        (format != DS4_TAP_FORMAT_RAW_HC &&
+         format != DS4_TAP_FORMAT_MEAN_HC) ||
+        DS4_N_HC == 0 || DS4_N_HC > DS4_MAX_HC ||
+        g->prefill_cap == 0) {
+        return false;
+    }
+
+    const uint64_t row_values = format == DS4_TAP_FORMAT_MEAN_HC ?
+        (uint64_t)DS4_N_EMBD : (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t row_bytes = row_values * sizeof(float);
+    g->tap_hidden =
+        ds4_gpu_tensor_alloc((uint64_t)count * row_bytes);
+    g->tap_hidden_batch =
+        ds4_gpu_tensor_alloc((uint64_t)count * g->prefill_cap * row_bytes);
+    if (!g->tap_hidden || !g->tap_hidden_batch) {
+        metal_graph_tap_clear(g);
+        return false;
+    }
+    if (format == DS4_TAP_FORMAT_MEAN_HC) {
+        g->tap_hc_mean_weights =
+            ds4_gpu_tensor_alloc((uint64_t)DS4_N_HC * sizeof(float));
+        g->tap_hc_mean_rows =
+            ds4_gpu_tensor_alloc((uint64_t)g->prefill_cap *
+                                 DS4_N_HC * sizeof(float));
+        if (!g->tap_hc_mean_weights || !g->tap_hc_mean_rows) {
+            metal_graph_tap_clear(g);
+            return false;
+        }
+        float mean[DS4_MAX_HC] = {0};
+        const float inv_hc = 1.0f / (float)DS4_N_HC;
+        for (uint32_t i = 0; i < DS4_N_HC; i++) mean[i] = inv_hc;
+        if (ds4_gpu_tensor_write(g->tap_hc_mean_weights,
+                                 0,
+                                 mean,
+                                 (uint64_t)DS4_N_HC * sizeof(mean[0])) == 0) {
+            metal_graph_tap_clear(g);
+            return false;
+        }
+        const uint64_t mean_rows_count = (uint64_t)g->prefill_cap * DS4_N_HC;
+        if (mean_rows_count > (uint64_t)SIZE_MAX / sizeof(float)) {
+            metal_graph_tap_clear(g);
+            return false;
+        }
+        float *mean_rows = xmalloc((size_t)mean_rows_count * sizeof(mean_rows[0]));
+        for (uint64_t i = 0; i < mean_rows_count; i++) mean_rows[i] = inv_hc;
+        const bool mean_rows_ok =
+            ds4_gpu_tensor_write(g->tap_hc_mean_rows,
+                                 0,
+                                 mean_rows,
+                                 mean_rows_count * sizeof(mean_rows[0])) != 0;
+        free(mean_rows);
+        if (!mean_rows_ok) {
+            metal_graph_tap_clear(g);
+            return false;
+        }
+    }
+
+    for (uint32_t i = 0; i < count; i++) g->tap_layers[i] = (uint32_t)layers[i];
+    g->tap_count = count;
+    g->tap_format = format;
+    g->tap_host = host;
+    g->tap_host_cap = host_cap;
+    g->tap_rows_out = rows_out;
     return true;
 }
 
@@ -25995,6 +26179,113 @@ static bool metal_graph_dspark_capture_prefill_rows(
     return ok;
 }
 
+static int metal_graph_tap_slot(
+        const ds4_gpu_graph *g,
+        uint32_t             il) {
+    if (!g || g->tap_count == 0) return -1;
+    for (uint32_t i = 0; i < g->tap_count; i++) {
+        if (g->tap_layers[i] == il) return (int)i;
+    }
+    return -1;
+}
+
+static uint64_t metal_graph_tap_row_values(const ds4_gpu_graph *g) {
+    return g->tap_format == DS4_TAP_FORMAT_MEAN_HC ?
+        (uint64_t)DS4_N_EMBD : (uint64_t)DS4_N_HC * DS4_N_EMBD;
+}
+
+/* Record the finished decode-layer output for tapped layer il. Runs at the
+ * same hook point as the DSpark capture: cur/after_ffn are already swapped,
+ * so metal_graph_cur_hc(g) holds this layer's output row. Untapped layers
+ * (and unconfigured graphs) return without touching the GPU. */
+static bool metal_graph_tap_capture_decode_layer(
+        ds4_gpu_graph *g,
+        uint32_t       il) {
+    const int slot = metal_graph_tap_slot(g, il);
+    if (slot < 0) return true;
+    const uint64_t row_bytes = metal_graph_tap_row_values(g) * sizeof(float);
+    ds4_gpu_tensor *dst =
+        ds4_gpu_tensor_view(g->tap_hidden,
+                            (uint64_t)(uint32_t)slot * row_bytes,
+                            row_bytes);
+    if (!dst) return false;
+    bool ok;
+    if (g->tap_format == DS4_TAP_FORMAT_MEAN_HC) {
+        ok = ds4_gpu_hc_weighted_sum_tensor(dst,
+                                            metal_graph_cur_hc(g),
+                                            g->tap_hc_mean_weights,
+                                            DS4_N_EMBD,
+                                            DS4_N_HC) != 0;
+    } else {
+        ok = ds4_gpu_tensor_copy(dst,
+                                 0,
+                                 metal_graph_cur_hc(g),
+                                 0,
+                                 row_bytes) != 0;
+    }
+    ds4_gpu_tensor_free(dst);
+    return ok;
+}
+
+/* Batch variant: capture all n_tokens rows of the finished prefill layer
+ * from batch_cur_hc into the tap slot's prefill rows. */
+static bool metal_graph_tap_capture_prefill_layer(
+        ds4_gpu_graph *g,
+        uint32_t       il,
+        uint32_t       n_tokens) {
+    const int slot = metal_graph_tap_slot(g, il);
+    if (slot < 0) return true;
+    if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
+    const uint64_t row_values = metal_graph_tap_row_values(g);
+    const uint64_t row_bytes = row_values * sizeof(float);
+    ds4_gpu_tensor *dst =
+        ds4_gpu_tensor_view(g->tap_hidden_batch,
+                            (uint64_t)(uint32_t)slot * g->prefill_cap * row_bytes,
+                            (uint64_t)n_tokens * row_bytes);
+    if (!dst) return false;
+    bool ok;
+    if (g->tap_format == DS4_TAP_FORMAT_MEAN_HC) {
+        ok = ds4_gpu_hc_weighted_sum_tensor(dst,
+                                            metal_graph_batch_cur_hc(g),
+                                            g->tap_hc_mean_rows,
+                                            DS4_N_EMBD,
+                                            DS4_N_HC) != 0;
+    } else {
+        ok = ds4_gpu_tensor_copy(dst,
+                                 0,
+                                 metal_graph_batch_cur_hc(g),
+                                 0,
+                                 (uint64_t)n_tokens * row_bytes) != 0;
+    }
+    ds4_gpu_tensor_free(dst);
+    return ok;
+}
+
+/* Mirror the captured rows into the session's host buffers. Called after the
+ * eval's command buffers complete, at the same point as the logits readback;
+ * records the row count so ds4_session_read_tap can size the copy. */
+static bool metal_graph_tap_readback_rows(
+        ds4_gpu_graph *g,
+        bool           batch,
+        uint32_t       n_rows) {
+    if (!g || g->tap_count == 0) return true;
+    if (!g->tap_host || n_rows == 0 || n_rows > g->tap_host_cap) return false;
+    const uint64_t row_bytes = metal_graph_tap_row_values(g) * sizeof(float);
+    bool ok = true;
+    for (uint32_t i = 0; ok && i < g->tap_count; i++) {
+        ds4_gpu_tensor *src = batch ? g->tap_hidden_batch : g->tap_hidden;
+        const uint64_t off = batch ?
+            (uint64_t)i * g->prefill_cap * row_bytes : (uint64_t)i * row_bytes;
+        ok = src && g->tap_host[i] &&
+             ds4_gpu_tensor_read(src,
+                                 off,
+                                 g->tap_host[i],
+                                 (uint64_t)n_rows * row_bytes) != 0;
+    }
+    if (ok && g->tap_rows_out) *g->tap_rows_out = n_rows;
+    return ok;
+}
+
 static bool metal_graph_dspark_capture_verified_suffix_begin(
         ds4_gpu_graph *g,
         uint32_t       start,
@@ -26158,6 +26449,7 @@ static bool metal_graph_encode_token_raw_swa(
         g->cur_hc_by_tier[g->active_tier] = metal_graph_after_ffn_hc(g);
         g->after_ffn_hc_by_tier[g->active_tier] = tmp;
         if (ok) ok = metal_graph_dspark_capture_decode_layer(g, il);
+        if (ok) ok = metal_graph_tap_capture_decode_layer(g, il);
         /* A TP gate uses one monotonic shared event for the whole token. A
          * later command buffer may signal a higher value while the prefix is
          * blocked at an earlier gate, making the transport consume a slab
@@ -29164,6 +29456,7 @@ static bool metal_graph_eval_token_raw_swa_streaming(
                 g->cur_hc_by_tier[g->active_tier] = metal_graph_after_ffn_hc(g);
                 g->after_ffn_hc_by_tier[g->active_tier] = tmp;
                 ok = metal_graph_dspark_capture_decode_layer(g, il);
+                if (ok) ok = metal_graph_tap_capture_decode_layer(g, il);
             }
         }
         if (ok && logits) {
@@ -29175,6 +29468,7 @@ static bool metal_graph_eval_token_raw_swa_streaming(
         if (ok && logits) {
             ok = ds4_gpu_tensor_read(metal_graph_logits(g), 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
         }
+        if (ok && g->tap_count) ok = metal_graph_tap_readback_rows(g, false, 1);
         const double t_read = (profile || throttle) ? now_sec() : 0.0;
         if (profile) {
             fprintf(stderr,
@@ -29231,6 +29525,7 @@ static bool metal_graph_eval_token_raw_swa_streaming(
             g->cur_hc_by_tier[g->active_tier] = metal_graph_after_ffn_hc(g);
             g->after_ffn_hc_by_tier[g->active_tier] = tmp;
             if (ok) ok = metal_graph_dspark_capture_decode_layer(g, il);
+            if (ok) ok = metal_graph_tap_capture_decode_layer(g, il);
         }
         const double tl_encoded = profile ? now_sec() : 0.0;
         if (ok) ok = ds4_gpu_end_commands() != 0;
@@ -29251,6 +29546,7 @@ static bool metal_graph_eval_token_raw_swa_streaming(
     if (ok && logits) {
         ok = ds4_gpu_tensor_read(metal_graph_logits(g), 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
+    if (ok && g->tap_count) ok = metal_graph_tap_readback_rows(g, false, 1);
     const double t_read = (profile || throttle) ? now_sec() : 0.0;
 
     if (profile) {
@@ -29308,6 +29604,7 @@ static bool metal_graph_eval_token_raw_swa(
     } else if (ok && logits && !(g->tp_world == 2 && g->tp_rank == 1)) {
         ok = ds4_gpu_tensor_read(metal_graph_logits(g), 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
+    if (ok && g->tap_count) ok = metal_graph_tap_readback_rows(g, false, 1);
     const double t_read = (profile || throttle) ? now_sec() : 0.0;
     if (profile) {
         fprintf(stderr,
@@ -33053,6 +33350,9 @@ static bool metal_graph_prefill_layer_major(
                                                                   il,
                                                                   start,
                                                                   n_tokens);
+            if (ok) ok = metal_graph_tap_capture_prefill_layer(g,
+                                                               il,
+                                                               (uint32_t)n_tokens);
             if (show_progress) {
                 fprintf(stderr, "ds4: gpu prefill layer %u/%u\r", il + 1, (uint32_t)DS4_N_LAYER);
                 fflush(stderr);
@@ -33106,6 +33406,9 @@ static bool metal_graph_prefill_layer_major(
         const double t_before_read = profile ? now_sec() : 0.0;
         if (logits) {
             ok = ds4_gpu_tensor_read(metal_graph_logits(g), 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+        }
+        if (ok && g->tap_count) {
+            ok = metal_graph_tap_readback_rows(g, true, (uint32_t)n_tokens);
         }
         if (profile) {
             const double t_read = now_sec();
@@ -33365,6 +33668,9 @@ static bool metal_graph_prefill_layer_major(
                                                                   il,
                                                                   start,
                                                                   n_tokens);
+            if (ok) ok = metal_graph_tap_capture_prefill_layer(g,
+                                                               il,
+                                                               (uint32_t)n_tokens);
             if (ok) ok = metal_graph_capture_prefill_seed_router_selected(g,
                                                                           il,
                                                                           n_tokens);
@@ -33415,6 +33721,9 @@ static bool metal_graph_prefill_layer_major(
                                                                   il,
                                                                   start,
                                                                   n_tokens);
+            if (ok) ok = metal_graph_tap_capture_prefill_layer(g,
+                                                               il,
+                                                               (uint32_t)n_tokens);
             if (ok) ok = metal_graph_capture_prefill_seed_router_selected(g,
                                                                           il,
                                                                           n_tokens);
@@ -33581,6 +33890,9 @@ static bool metal_graph_prefill_layer_major(
     const double t_before_read = profile ? now_sec() : 0.0;
     if (logits) {
         ok = ds4_gpu_tensor_read(metal_graph_logits(g), 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+    }
+    if (ok && g->tap_count) {
+        ok = metal_graph_tap_readback_rows(g, true, (uint32_t)n_tokens);
     }
     if (profile) {
         const double t_read = now_sec();
@@ -37108,7 +37420,8 @@ static int generate_raw_swa_cpu(
     prefill_layer_major_cpu(logits, model, weights, &cache, prompt,
                             directional_steering_dirs,
                             directional_steering_attn,
-                            directional_steering_ffn);
+                            directional_steering_ffn,
+                            NULL);
 
     const double t_prefill1 = now_sec();
     fprintf(stderr, "ds4: prefill %d/%d done\n", prompt->len, prompt->len);
@@ -37156,7 +37469,8 @@ static int generate_raw_swa_cpu(
                                                  directional_steering_dirs,
                                                  directional_steering_attn,
                                                  directional_steering_ffn,
-                                                 &decode_scratch);
+                                                 &decode_scratch,
+                                                 NULL);
         ds4_alloc_guard_end();
         if (token_timing) {
             const double t_eval1 = now_sec();
@@ -47495,6 +47809,16 @@ struct ds4_session {
     token_vec greedy_splitkv_segment;
     float *logits;
     float *sample_probs;
+    /* Hidden-state tap host mirrors (HIDDEN_EXPORT.md M2), configured by
+     * ds4_session_set_hidden_taps: one row buffer per tapped layer, written
+     * after each eval (GPU readback or CPU memcpy). Row width is hc_dim f32
+     * for RAW_HC, n_embd f32 for MEAN_HC. */
+    int tap_layers[DS4_MAX_TAP_LAYERS];
+    int tap_count;
+    int tap_format;
+    float *tap_host[DS4_MAX_TAP_LAYERS];
+    uint32_t tap_host_cap;
+    uint32_t tap_rows;
     float *mtp_logits;
     int greedy_splitkv_anchor_len;
 #ifndef DS4_NO_GPU
@@ -56905,8 +57229,129 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 #endif
 }
 
+/* Release the session's tap set: graph-side capture tensors plus the
+ * session-owned host row buffers. */
+static void ds4_session_tap_release(ds4_session *s) {
+    if (!s) return;
+#ifndef DS4_NO_GPU
+    if (!ds4_session_is_cpu(s) && !ds4_session_is_glm(s)) {
+        metal_graph_tap_clear(&s->graph);
+    }
+#endif
+    for (int i = 0; i < DS4_MAX_TAP_LAYERS; i++) {
+        free(s->tap_host[i]);
+        s->tap_host[i] = NULL;
+    }
+    s->tap_count = 0;
+    s->tap_format = DS4_TAP_FORMAT_RAW_HC;
+    s->tap_host_cap = 0;
+    s->tap_rows = 0;
+}
+
+/* Host-side view of the tap set, passed to the CPU reference forward paths. */
+static ds4_tap_host_cfg ds4_session_tap_cfg(ds4_session *s) {
+    ds4_tap_host_cfg cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    if (s && s->tap_count > 0) {
+        cfg.layers = s->tap_layers;
+        cfg.count = s->tap_count;
+        cfg.format = s->tap_format;
+        cfg.host = s->tap_host;
+        cfg.host_cap = s->tap_host_cap;
+        cfg.rows_out = &s->tap_rows;
+    }
+    return cfg;
+}
+
+int ds4_session_set_hidden_taps(ds4_session *s, const int *layers,
+                                int n_layers, int format) {
+    if (!s || !s->engine) return -1;
+    if (n_layers < 0 || n_layers > DS4_MAX_TAP_LAYERS) return -1;
+    if (n_layers > 0 && !layers) return -1;
+    if (format != DS4_TAP_FORMAT_RAW_HC &&
+        format != DS4_TAP_FORMAT_MEAN_HC) return -1;
+    const int n_layer = ds4_engine_layer_count(s->engine);
+    for (int i = 0; i < n_layers; i++) {
+        if (layers[i] < 0 || layers[i] >= n_layer) return -1;
+        for (int j = 0; j < i; j++) {
+            if (layers[j] == layers[i]) return -1; /* ambiguous read_tap slot */
+        }
+    }
+    if (ds4_session_is_glm(s)) {
+        fprintf(stderr, "ds4: hidden taps are not supported on GLM sessions yet\n");
+        return -1;
+    }
+    if (s->engine->tp.active) {
+        fprintf(stderr, "ds4: hidden taps are not supported with tensor parallelism yet\n");
+        return -1;
+    }
+    if (s->distributed) {
+        fprintf(stderr, "ds4: hidden taps are not supported on distributed coordinator sessions\n");
+        return -1;
+    }
+
+    ds4_session_tap_release(s);
+    if (n_layers == 0) return 0;
+
+    /* Host buffers are sized for the largest single eval: one decode row or
+     * one prefill chunk. The CPU reference prefill is not chunked and
+     * truncates to this cap (debug-only path). */
+    const uint32_t cap = s->prefill_cap ? s->prefill_cap : 1;
+    const uint64_t row_values = format == DS4_TAP_FORMAT_MEAN_HC ?
+        (uint64_t)DS4_N_EMBD : ds4_engine_hidden_f32_values(s->engine);
+    if ((uint64_t)cap * row_values > (uint64_t)SIZE_MAX / sizeof(float)) {
+        return -1;
+    }
+    for (int i = 0; i < n_layers; i++) {
+        s->tap_host[i] =
+            xcalloc((size_t)cap * (size_t)row_values, sizeof(float));
+        s->tap_layers[i] = layers[i];
+    }
+    s->tap_count = n_layers;
+    s->tap_format = format;
+    s->tap_host_cap = cap;
+    s->tap_rows = 0;
+#ifndef DS4_NO_GPU
+    if (!ds4_session_is_cpu(s) &&
+        !metal_graph_configure_taps(&s->graph,
+                                    layers,
+                                    (uint32_t)n_layers,
+                                    format,
+                                    s->tap_host,
+                                    cap,
+                                    &s->tap_rows)) {
+        fprintf(stderr, "ds4: failed to configure hidden tap capture\n");
+        ds4_session_tap_release(s);
+        return -1;
+    }
+#endif
+    return 0;
+}
+
+int ds4_session_read_tap(const ds4_session *s, int layer,
+                         float *out, int max_rows) {
+    if (!s || !out || max_rows < 0) return -1;
+    int slot = -1;
+    for (int i = 0; i < s->tap_count; i++) {
+        if (s->tap_layers[i] == layer) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0 || !s->tap_host[slot]) return -1;
+    if (s->tap_rows == 0) return 0; /* no eval since (re)configuration */
+    if ((uint32_t)max_rows < s->tap_rows) return -1;
+    const uint64_t row_values = s->tap_format == DS4_TAP_FORMAT_MEAN_HC ?
+        (uint64_t)DS4_N_EMBD : ds4_engine_hidden_f32_values(s->engine);
+    memcpy(out,
+           s->tap_host[slot],
+           (size_t)s->tap_rows * (size_t)row_values * sizeof(float));
+    return (int)s->tap_rows;
+}
+
 void ds4_session_free(ds4_session *s) {
     if (!s) return;
+    ds4_session_tap_release(s);
     if (ds4_session_tp_leader(s) && s->tp_session_id != 0 &&
         !ds4_tp_failed(s->engine->tp.ctx)) {
         char err[256] = "";
@@ -57658,6 +58103,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                     g->after_ffn_hc_by_tier[g->active_tier] = tmp;
                 }
                 if (ok) ok = metal_graph_dspark_capture_decode_layer(g, il);
+                if (ok) ok = metal_graph_tap_capture_decode_layer(g, il);
                 if (ok) ok = ds4_gpu_end_commands() != 0;
             }
             if (ok && output_logits) {
@@ -57683,6 +58129,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                 g->cur_hc_by_tier[g->active_tier] = metal_graph_after_ffn_hc(g);
                 g->after_ffn_hc_by_tier[g->active_tier] = tmp;
                 if (ok) ok = metal_graph_dspark_capture_decode_layer(g, il);
+                if (ok) ok = metal_graph_tap_capture_decode_layer(g, il);
                 encoded_layers++;
                 if (ok &&
                     split_after_layers != 0 &&
@@ -57704,6 +58151,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         if (ok && output_logits) {
             ok = ds4_gpu_tensor_read(metal_graph_logits(g), 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
         }
+        if (ok && g->tap_count) ok = metal_graph_tap_readback_rows(g, false, 1);
         if (!ok) {
             if (ds4_gpu_synchronize() == 0) {
                 fprintf(stderr, "ds4: synchronize after layer-slice decode failure also failed\n");
@@ -57765,6 +58213,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                                                     pos0,
                                                     n_tokens);
                 if (ok) ok = metal_graph_dspark_capture_prefill_layer(g, il, pos0, n_tokens);
+                if (ok) ok = metal_graph_tap_capture_prefill_layer(g, il, n_tokens);
             }
             if (ok) ok = ds4_gpu_end_commands() != 0;
         }
@@ -57778,6 +58227,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                                                 pos0,
                                                 n_tokens);
             if (ok) ok = metal_graph_dspark_capture_prefill_layer(g, il, pos0, n_tokens);
+            if (ok) ok = metal_graph_tap_capture_prefill_layer(g, il, n_tokens);
         }
     }
     if (ok && output_logits) {
@@ -57807,6 +58257,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
     if (ok && output_logits) {
         ok = ds4_gpu_tensor_read(metal_graph_logits(g), 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
+    if (ok && g->tap_count) ok = metal_graph_tap_readback_rows(g, true, n_tokens);
     if (!ok) {
         if (ds4_gpu_synchronize() == 0) {
             fprintf(stderr, "ds4: synchronize after layer-slice failure also failed\n");
@@ -58122,6 +58573,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
     }
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
+        const ds4_tap_host_cfg tap_cfg = ds4_session_tap_cfg(s);
         if (s->checkpoint_valid &&
             prompt->len >= s->checkpoint.len &&
             ds4_tokens_starts_with(prompt, &s->checkpoint))
@@ -58143,7 +58595,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                                                          e->directional_steering_dirs,
                                                          e->directional_steering_attn_scale,
                                                          e->directional_steering_ffn_scale,
-                                                         &s->cpu_scratch);
+                                                         &s->cpu_scratch,
+                                                         &tap_cfg);
                 token_vec_push(&s->checkpoint, prompt->v[i]);
                 if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
             }
@@ -58161,7 +58614,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                                 prompt,
                                 e->directional_steering_dirs,
                                 e->directional_steering_attn_scale,
-                                e->directional_steering_ffn_scale);
+                                e->directional_steering_ffn_scale,
+                                &tap_cfg);
         ds4_tokens_copy(&s->checkpoint, prompt);
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
@@ -59762,6 +60216,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     }
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
+        const ds4_tap_host_cfg tap_cfg = ds4_session_tap_cfg(s);
         forward_token_raw_swa_cpu_decode_scratch(s->logits,
                                                  &e->model,
                                                  &e->weights,
@@ -59771,7 +60226,8 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                                  e->directional_steering_dirs,
                                                  e->directional_steering_attn_scale,
                                                  e->directional_steering_ffn_scale,
-                                                 &s->cpu_scratch);
+                                                 &s->cpu_scratch,
+                                                 &tap_cfg);
         token_vec_push(&s->checkpoint, token);
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;

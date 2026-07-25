@@ -68,6 +68,9 @@ typedef enum {
     DS4_DISTRIBUTED_NONE = 0,
     DS4_DISTRIBUTED_COORDINATOR,
     DS4_DISTRIBUTED_WORKER,
+    /* `./ds4 --role train-sink`: pure hidden-export consumer (HIDDEN_EXPORT.md
+     * 3.4); loads no model and runs no pipeline. */
+    DS4_DISTRIBUTED_TRAIN_SINK,
 } ds4_distributed_role;
 
 typedef struct {
@@ -232,6 +235,22 @@ void ds4_engine_tp_gate_schedule(ds4_engine *e,
 uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer);
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
 int ds4_engine_embd_dim(ds4_engine *e);
+
+/* Hidden-state taps (HIDDEN_EXPORT.md): capture per-layer hidden rows of the
+ * most recent eval into session-owned host buffers. Decode yields 1 row,
+ * prefill/batch one row per submitted token in position order. No tensor
+ * internals cross this boundary: callers see position-indexed f32 rows only. */
+#define DS4_TAP_FORMAT_RAW_HC  0   /* hc_dim f32 per row (n_embd for GLM) */
+#define DS4_TAP_FORMAT_MEAN_HC 1   /* n_embd f32 per row */
+
+/* Replace the session's tap set. n_layers == 0 disables tapping. Returns 0 on
+ * success, <0 on invalid layers/format or an unsupported session. */
+int ds4_session_set_hidden_taps(ds4_session *s, const int *layers,
+                                int n_layers, int format);
+/* Copy the rows captured by the most recent eval for one tapped layer.
+ * Returns the row count, or <0 on error (unknown layer, buffer too small). */
+int ds4_session_read_tap(const ds4_session *s, int layer,
+                         float *out, int max_rows);
 uint64_t ds4_engine_model_bytes(ds4_engine *e);
 int ds4_engine_tp_vocab_split(ds4_engine *e);
 bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,

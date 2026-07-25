@@ -23,6 +23,7 @@
 /tests/test_cuda_mixed_batch
 /tests/test_cuda_session_batch
 /tests/test_layer_pack
+/tests/test_hsexport
 /tests/test_metal_session_batch
 /tests/test_q4k_dot
 /tests/test_sampling

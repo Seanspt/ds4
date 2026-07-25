@@ -570,6 +570,7 @@ static const char *dist_role_name(ds4_distributed_role role) {
     case DS4_DISTRIBUTED_NONE:        return "none";
     case DS4_DISTRIBUTED_COORDINATOR: return "coordinator";
     case DS4_DISTRIBUTED_WORKER:      return "worker";
+    case DS4_DISTRIBUTED_TRAIN_SINK:  return "train-sink";
     }
     return "unknown";
 }
@@ -1524,8 +1525,8 @@ static uint64_t dist_u64_from_halves(uint32_t hi, uint32_t lo) {
 
 /* FNV-1a over little-endian token IDs.  This is not a security primitive; it is
  * a compact session invariant so distributed workers can reject same-position
- * but different-prefix KV state before doing layer work. */
-#define DS4_DIST_TOKEN_HASH_INIT 1469598103934665603ull
+ * but different-prefix KV state before doing layer work.  The INIT constant
+ * lives in ds4_distributed.h; ds4_hsexport.c computes identical hashes. */
 #define DS4_DIST_TOKEN_HASH_PRIME 1099511628211ull
 
 static uint64_t dist_token_hash_update(uint64_t h, int token) {
@@ -1540,6 +1541,10 @@ static uint64_t dist_token_hash_update(uint64_t h, int token) {
 static uint64_t dist_token_hash_update_span(uint64_t h, const int *tokens, uint32_t n_tokens) {
     for (uint32_t i = 0; i < n_tokens; i++) h = dist_token_hash_update(h, tokens[i]);
     return h;
+}
+
+uint64_t ds4_dist_token_hash_update_span(uint64_t h, const int *tokens, uint32_t n_tokens) {
+    return dist_token_hash_update_span(h, tokens, n_tokens);
 }
 
 static uint64_t dist_token_hash_prefix(const int *tokens, uint32_t n_tokens) {
@@ -8396,6 +8401,10 @@ static bool dist_parse_role(const char *s, ds4_distributed_role *out) {
         *out = DS4_DISTRIBUTED_WORKER;
         return true;
     }
+    if (!strcmp(s, "train-sink")) {
+        *out = DS4_DISTRIBUTED_TRAIN_SINK;
+        return true;
+    }
     return false;
 }
 
@@ -8487,7 +8496,8 @@ static bool dist_cli_parse_port(const char *s, const char *arg, int *out, char *
 }
 
 bool ds4_dist_enabled(const ds4_dist_options *opt) {
-    return opt && opt->role != DS4_DISTRIBUTED_NONE;
+    return opt && (opt->role == DS4_DISTRIBUTED_COORDINATOR ||
+                   opt->role == DS4_DISTRIBUTED_WORKER);
 }
 
 ds4_dist_options *ds4_dist_options_create(void) {
@@ -8536,7 +8546,7 @@ ds4_dist_cli_parse_result ds4_dist_parse_cli_arg(
         if (!role) return DS4_DIST_CLI_ERROR;
         if (!opt || !dist_parse_role(role, &opt->role)) {
             if (errlen) snprintf(err, errlen,
-                                 "invalid distributed role: %s (valid roles: none, coordinator, worker)",
+                                 "invalid distributed role: %s (valid roles: none, coordinator, worker, train-sink)",
                                  role);
             return DS4_DIST_CLI_ERROR;
         }
@@ -8664,7 +8674,8 @@ static int dist_validate_options(const ds4_dist_options *opt, char *err, size_t 
         return 1;
     }
 
-    if (opt->role == DS4_DISTRIBUTED_NONE) {
+    if (opt->role == DS4_DISTRIBUTED_NONE ||
+        opt->role == DS4_DISTRIBUTED_TRAIN_SINK) {
         if (opt->layers.set || opt->listen_host || opt->listen_port ||
             opt->coordinator_host || opt->coordinator_port ||
             opt->prefill_chunk != 0 || opt->prefill_window != 0 ||

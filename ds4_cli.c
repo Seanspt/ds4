@@ -3,6 +3,7 @@
 #include "ds4_gpu_args.h"
 #include "ds4_tp.h"
 #include "ds4_help.h"
+#include "ds4_hsexport.h"
 #include "linenoise.h"
 
 /* ds4 CLI.
@@ -99,6 +100,18 @@ typedef struct {
      * Resolved post-parse via parse_gpu_vram_arg(). */
     const char *gpu_vram_arg;
     const char *gpu_devices_arg;
+    /* Hidden-state export (HIDDEN_EXPORT.md), interactive REPL only. */
+    const char *hidden_export_host;
+    int hidden_export_port;
+    const char *hidden_export_layers;
+    const char *hidden_export_format;
+    ds4_hsexport *exporter;
+    int export_layers[DS4_HSEXPORT_MAX_LAYERS];
+    int export_n_layers;
+    /* Train-sink consumer (`--role train-sink`): no model is loaded. */
+    const char *hidden_source_host;
+    int hidden_source_port;
+    const char *hidden_dump_path;
 } cli_config;
 
 static volatile sig_atomic_t cli_interrupted;
@@ -1395,7 +1408,17 @@ static int repl_chat_init(ds4_engine *engine, repl_chat *chat, const cli_config 
     if (cfg->gen.system && cfg->gen.system[0]) {
         ds4_chat_append_message(engine, &chat->transcript, "system", cfg->gen.system);
     }
-    return repl_chat_create_session(engine, chat, cfg->gen.ctx_size);
+    int rc = repl_chat_create_session(engine, chat, cfg->gen.ctx_size);
+    if (rc == 0 && cfg->exporter) {
+        char xerr[160];
+        if (ds4_hsexport_attach(cfg->exporter, chat->session, 1,
+                                cfg->export_layers, cfg->export_n_layers,
+                                xerr, sizeof(xerr)) != 0) {
+            fprintf(stderr, "ds4: hidden export attach failed: %s\n", xerr);
+            return 1;
+        }
+    }
+    return rc;
 }
 
 static void repl_chat_free(repl_chat *chat) {
@@ -1414,6 +1437,41 @@ static int repl_chat_set_ctx(ds4_engine *engine, repl_chat *chat, int ctx_size) 
 
 static bool repl_chat_assistant_turn_uses_eos(ds4_engine *engine) {
     return !ds4_engine_is_glm_dsa(engine);
+}
+
+/* Hidden export: sync one engine prefill chunk at a time so the rows of every
+ * internal eval are emitted exactly once (a tap holds only the rows of the
+ * most recent eval). Mirrors the non-export semantics of one full sync. */
+static int cli_export_sync(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
+                           char *err, size_t errlen) {
+    const int chunk = (int)ds4_engine_prefill_chunk(engine);
+    const ds4_tokens *prompt = &chat->transcript;
+    const int live = ds4_session_pos(chat->session);
+    const int common = ds4_session_common_prefix(chat->session, prompt);
+    int done = (common == live && prompt->len >= live) ? live : 0;
+    while (done < prompt->len) {
+        int target = done + chunk;
+        if (target > prompt->len || target < done) target = prompt->len;
+        ds4_tokens prefix = *prompt;
+        prefix.len = target;
+        /* Rows evaluated by this sync start at the common frontier (a rebuild
+         * truncates back to it first). */
+        const int start = ds4_session_common_prefix(chat->session, &prefix);
+        cli_dist_busy_set(cfg, true);
+        int rc = ds4_session_sync(chat->session, &prefix, err, errlen);
+        cli_dist_busy_set(cfg, false);
+        if (rc != 0) return rc;
+        done = ds4_session_pos(chat->session);
+        if (done > start) {
+            ds4_hsexport_emit(cfg->exporter, chat->session,
+                              (uint32_t)start, (uint32_t)(done - start));
+        }
+        if (done < target) {
+            if (err && errlen) snprintf(err, errlen, "prefill made no progress");
+            return 1;
+        }
+    }
+    return 0;
 }
 
 /* Run one interactive turn.  The transcript is tentatively extended with user
@@ -1450,7 +1508,12 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
                                      progress.use_color ? cli_prefill_progress_cb : NULL,
                                      progress.use_color ? &progress : NULL);
     cli_dist_busy_set(cfg, true);
-    int sync_rc = ds4_session_sync(chat->session, &chat->transcript, err, sizeof(err));
+    int sync_rc;
+    if (cfg->exporter) {
+        sync_rc = cli_export_sync(engine, cfg, chat, err, sizeof(err));
+    } else {
+        sync_rc = ds4_session_sync(chat->session, &chat->transcript, err, sizeof(err));
+    }
     cli_dist_busy_set(cfg, false);
     if (sync_rc != 0) {
         ds4_session_set_progress(chat->session, NULL, NULL);
@@ -1481,6 +1544,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
     int generated = 0;
     const bool speculative_argmax = cfg->gen.temperature <= 0.0f &&
+        !cfg->exporter &&
         ((ds4_session_spec_draft_tokens(chat->session) > 1 &&
           getenv("DS4_MTP_SPEC_DISABLE") == NULL) ||
          cli_splitkv_spec_requested());
@@ -1506,7 +1570,8 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && ds4_session_spec_draft_tokens(chat->session) > 1 &&
+        if (cfg->gen.temperature <= 0.0f && !cfg->exporter &&
+            ds4_session_spec_draft_tokens(chat->session) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
             cli_dist_busy_set(cfg, true);
             ntok = ds4_session_eval_speculative_argmax(chat->session,
@@ -1538,6 +1603,10 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
                 ds4_session_invalidate(chat->session);
                 return 1;
+            }
+            if (cfg->exporter) {
+                ds4_hsexport_emit(cfg->exporter, chat->session,
+                                  (uint32_t)(ds4_session_pos(chat->session) - 1), 1);
             }
             if (generated >= max_tokens) break;
             continue;
@@ -1664,10 +1733,22 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
                                    cfg->gen.ctx_size,
                                    ds4_engine_prefill_chunk(engine),
                                    cfg->engine.ssd_streaming);
+                if (cfg->exporter) ds4_hsexport_detach(cfg->exporter, chat.session);
                 rc = repl_chat_set_ctx(engine, &chat, cfg->gen.ctx_size);
                 if (rc != 0) {
                     linenoiseFree(line);
                     break;
+                }
+                if (cfg->exporter) {
+                    char xerr[160];
+                    if (ds4_hsexport_attach(cfg->exporter, chat.session, 1,
+                                            cfg->export_layers, cfg->export_n_layers,
+                                            xerr, sizeof(xerr)) != 0) {
+                        fprintf(stderr, "ds4: hidden export attach failed: %s\n", xerr);
+                        linenoiseFree(line);
+                        rc = 1;
+                        break;
+                    }
                 }
                 ds4_think_mode effective = ds4_think_mode_for_context(cfg->gen.think_mode,
                                                                       chat.ctx_size);
@@ -1697,6 +1778,7 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
         linenoiseFree(line);
     }
     if (sigint_installed) sigaction(SIGINT, &old_int, NULL);
+    if (cfg->exporter) ds4_hsexport_detach(cfg->exporter, chat.session);
     repl_chat_free(&chat);
     return rc;
 }
@@ -2013,6 +2095,18 @@ static cli_config parse_options(int argc, char **argv) {
             c.inspect = true;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
+        } else if (!strcmp(arg, "--hidden-export-listen")) {
+            c.hidden_export_host = need_arg(&i, argc, argv, arg);
+            c.hidden_export_port = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--hidden-export-layers")) {
+            c.hidden_export_layers = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--hidden-export-format")) {
+            c.hidden_export_format = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--hidden-source")) {
+            c.hidden_source_host = need_arg(&i, argc, argv, arg);
+            c.hidden_source_port = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--dump")) {
+            c.hidden_dump_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--server")) {
             fprintf(stderr, "ds4: use ds4-server for the HTTP server\n");
             exit(2);
@@ -2038,6 +2132,39 @@ static cli_config parse_options(int argc, char **argv) {
         fprintf(stderr, "ds4: --perplexity-file does not use -p/--prompt-file\n");
         exit(2);
     }
+    if (c.hidden_export_host || c.hidden_export_layers || c.hidden_export_format) {
+        /* Hidden-state export (Phase 1) assumes a single append-only session:
+         * refuse combinations whose eval paths the exporter cannot follow. */
+        if (!c.hidden_export_host || !c.hidden_export_layers) {
+            fprintf(stderr,
+                    "ds4: hidden export requires --hidden-export-listen HOST PORT and --hidden-export-layers CSV\n");
+            exit(2);
+        }
+        if (c.hidden_export_format &&
+            strcmp(c.hidden_export_format, "f32") &&
+            strcmp(c.hidden_export_format, "f16")) {
+            fprintf(stderr, "ds4: --hidden-export-format must be f32 or f16\n");
+            exit(2);
+        }
+        int probe[DS4_HSEXPORT_MAX_LAYERS];
+        if (ds4_hsexport_parse_layers(c.hidden_export_layers,
+                                      probe, DS4_HSEXPORT_MAX_LAYERS) < 0) {
+            fprintf(stderr,
+                    "ds4: --hidden-export-layers must be 1..%d comma-separated layer ids\n",
+                    DS4_HSEXPORT_MAX_LAYERS);
+            exit(2);
+        }
+        if (c.gen.prompt) {
+            fprintf(stderr,
+                    "ds4: hidden export is wired to the interactive REPL only (no -p/--prompt-file)\n");
+            exit(2);
+        }
+        if (c.engine.mtp_path || c.engine.dspark || c.engine.glm_mtp) {
+            fprintf(stderr,
+                    "ds4: hidden export is not supported with speculative decoding (--mtp/--dspark/--glm-mtp)\n");
+            exit(2);
+        }
+    }
     char tp_err[256];
     if (!ds4_tp_adopt_distributed_options(&c.engine.tp, c.dist,
                                           tp_err, sizeof(tp_err))) {
@@ -2053,12 +2180,55 @@ static cli_config parse_options(int argc, char **argv) {
         fprintf(stderr, "ds4: %s\n", tp_err);
         exit(2);
     }
+    if (c.engine.distributed.role == DS4_DISTRIBUTED_TRAIN_SINK) {
+        /* Pure consumer: loads no model, drives no inference. */
+        if (!c.hidden_source_host || !c.hidden_dump_path) {
+            fprintf(stderr,
+                    "ds4: --role train-sink requires --hidden-source HOST PORT and --dump FILE\n");
+            exit(2);
+        }
+        if (c.hidden_export_host || c.hidden_export_layers || c.hidden_export_format) {
+            fprintf(stderr, "ds4: --role train-sink does not take --hidden-export-* options\n");
+            exit(2);
+        }
+        if (c.gen.prompt) {
+            fprintf(stderr, "ds4: --role train-sink does not use -p/--prompt-file\n");
+            exit(2);
+        }
+    } else if (c.hidden_source_host || c.hidden_dump_path) {
+        fprintf(stderr, "ds4: --hidden-source/--dump require --role train-sink\n");
+        exit(2);
+    }
 
     return c;
 }
 
 int main(int argc, char **argv) {
     cli_config cfg = parse_options(argc, argv);
+    if (cfg.engine.distributed.role == DS4_DISTRIBUTED_TRAIN_SINK) {
+        /* Pure consumer path: no model load, no engine. */
+        struct sigaction old_int, old_term, sa;
+        memset(&sa, 0, sizeof(sa));
+        sigemptyset(&sa.sa_mask);
+        sa.sa_handler = cli_sigint_handler;
+        const bool int_installed = sigaction(SIGINT, &sa, &old_int) == 0;
+        const bool term_installed = sigaction(SIGTERM, &sa, &old_term) == 0;
+        cli_interrupt_clear();
+        ds4_hsexport_sink_options xopt = {
+            .host = cfg.hidden_source_host,
+            .port = cfg.hidden_source_port,
+            .dump_path = cfg.hidden_dump_path,
+        };
+        char xerr[512];
+        const int rc = ds4_hsexport_sink_run(&xopt, &cli_interrupted,
+                                             xerr, sizeof(xerr));
+        if (rc != 0) fprintf(stderr, "ds4: %s\n", xerr);
+        if (int_installed) sigaction(SIGINT, &old_int, NULL);
+        if (term_installed) sigaction(SIGTERM, &old_term, NULL);
+        ds4_dist_options_free(cfg.dist);
+        free(cfg.prompt_owned);
+        return rc;
+    }
     if (cfg.gen.dump_tokens) {
         if (cfg.gen.prompt == NULL) {
             fprintf(stderr, "ds4: --dump-tokens requires -p or --prompt-file\n");
@@ -2194,7 +2364,29 @@ int main(int argc, char **argv) {
     } else if (cfg.gen.perplexity_file_path) {
         rc = run_perplexity_file(engine, &cfg);
     } else if (cfg.gen.prompt == NULL) {
-        rc = run_repl(engine, &cfg);
+        if (cfg.hidden_export_host) {
+            cfg.export_n_layers =
+                ds4_hsexport_parse_layers(cfg.hidden_export_layers,
+                                          cfg.export_layers,
+                                          DS4_HSEXPORT_MAX_LAYERS);
+            ds4_hsexport_options xopt = {
+                .host = cfg.hidden_export_host,
+                .port = cfg.hidden_export_port,
+                .bits = (cfg.hidden_export_format &&
+                         !strcmp(cfg.hidden_export_format, "f16")) ? 16 : 32,
+            };
+            char xerr[256];
+            cfg.exporter = ds4_hsexport_start(engine, &xopt, xerr, sizeof(xerr));
+            if (!cfg.exporter) {
+                fprintf(stderr, "ds4: hidden export failed to start: %s\n", xerr);
+                rc = 1;
+            }
+        }
+        if (rc == 0) rc = run_repl(engine, &cfg);
+        if (cfg.exporter) {
+            ds4_hsexport_stop(cfg.exporter);
+            cfg.exporter = NULL;
+        }
     } else {
         rc = run_generation(engine, &cfg);
     }

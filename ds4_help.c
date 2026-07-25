@@ -362,6 +362,20 @@ static void print_kv_cache(FILE *fp, const help_colors *c) {
     fputc('\n', fp);
 }
 
+static void print_hidden_export(FILE *fp, const help_colors *c, ds4_help_tool tool) {
+    title(fp, c, "Hidden-State Export");
+    opt(fp, c, "--hidden-export-listen HOST PORT", "Stream tapped hidden states to one TCP subscriber.");
+    opt(fp, c, "--hidden-export-layers CSV", "Tapped layers, e.g. 40,41,42 (max 8). Required with export.");
+    opt(fp, c, "--hidden-export-format f32|f16", "Wire payload width. Default: f32");
+    opt(fp, c, "--role train-sink --hidden-source HOST PORT --dump FILE",
+        "Model-free consumer: verify and dump a publisher's stream (see HIDDEN_EXPORT.md).");
+    para(fp, c, "Protocol and subscriber contract: HIDDEN_EXPORT.md. Trusted networks only (no auth/encryption).");
+    para(fp, c, "Not combinable with speculative decoding or (ds4-server) --batched-session.");
+    if (tool == DS4_HELP_DS4)
+        para(fp, c, "Wired to the interactive REPL only, not -p/--prompt-file one-shot generation.");
+    fputc('\n', fp);
+}
+
 static void print_bench_specific(FILE *fp, const help_colors *c) {
     title(fp, c, "Benchmark Input");
     opt(fp, c, "--prompt-file FILE", "Raw benchmark text; token sequence is sliced at each frontier.");
@@ -406,9 +420,11 @@ static bool tool_has_topic(ds4_help_tool tool, const char *topic) {
         return tool == DS4_HELP_DS4 || tool == DS4_HELP_SERVER || tool == DS4_HELP_AGENT;
     switch (tool) {
     case DS4_HELP_DS4:
-        return streq(topic, "diagnostics") || streq(topic, "commands");
+        return streq(topic, "diagnostics") || streq(topic, "commands") ||
+               streq(topic, "hidden-export");
     case DS4_HELP_SERVER:
-        return streq(topic, "api") || streq(topic, "kv-cache") || streq(topic, "thinking");
+        return streq(topic, "api") || streq(topic, "kv-cache") ||
+               streq(topic, "thinking") || streq(topic, "hidden-export");
     case DS4_HELP_AGENT:
         return streq(topic, "sessions") || streq(topic, "commands") || streq(topic, "tools");
     case DS4_HELP_BENCH:
@@ -442,10 +458,12 @@ static void print_more_info(FILE *fp, const help_colors *c, ds4_help_tool tool) 
     if (tool == DS4_HELP_DS4) {
         more_line(fp, c, "Interactive commands:", "commands");
         more_line(fp, c, "Diagnostics:", "diagnostics");
+        more_line(fp, c, "Hidden-state export:", "hidden-export");
     } else if (tool == DS4_HELP_SERVER) {
         more_line(fp, c, "HTTP API:", "api");
         more_line(fp, c, "Disk KV cache:", "kv-cache");
         more_line(fp, c, "Thinking behavior:", "thinking");
+        more_line(fp, c, "Hidden-state export:", "hidden-export");
     } else if (tool == DS4_HELP_AGENT) {
         more_line(fp, c, "Agent sessions:", "sessions");
         more_line(fp, c, "Agent commands:", "commands");
@@ -511,10 +529,12 @@ static void print_topic(FILE *fp, const help_colors *c, ds4_help_tool tool, cons
         if (tool == DS4_HELP_DS4) {
             print_cli_specific(fp, c, true);
             print_cli_commands(fp, c);
+            print_hidden_export(fp, c, tool);
         } else if (tool == DS4_HELP_SERVER) {
             print_server_api(fp, c);
             print_server_thinking(fp, c);
             print_kv_cache(fp, c);
+            print_hidden_export(fp, c, tool);
         } else if (tool == DS4_HELP_AGENT) {
             print_agent_specific(fp, c);
             print_agent_sessions(fp, c);
@@ -532,9 +552,11 @@ static void print_topic(FILE *fp, const help_colors *c, ds4_help_tool tool, cons
     else if (streq(topic, "distributed")) print_distributed(fp, c);
     else if (tool == DS4_HELP_DS4 && streq(topic, "diagnostics")) print_cli_diagnostics(fp, c);
     else if (tool == DS4_HELP_DS4 && streq(topic, "commands")) print_cli_commands(fp, c);
+    else if (tool == DS4_HELP_DS4 && streq(topic, "hidden-export")) print_hidden_export(fp, c, tool);
     else if (tool == DS4_HELP_SERVER && streq(topic, "api")) print_server_api(fp, c);
     else if (tool == DS4_HELP_SERVER && streq(topic, "kv-cache")) print_kv_cache(fp, c);
     else if (tool == DS4_HELP_SERVER && streq(topic, "thinking")) print_server_thinking(fp, c);
+    else if (tool == DS4_HELP_SERVER && streq(topic, "hidden-export")) print_hidden_export(fp, c, tool);
     else if (tool == DS4_HELP_AGENT && streq(topic, "sessions")) print_agent_sessions(fp, c);
     else if (tool == DS4_HELP_AGENT && streq(topic, "commands")) print_agent_sessions(fp, c);
     else if (tool == DS4_HELP_AGENT && streq(topic, "tools")) {

@@ -5654,6 +5654,261 @@ static void test_local_golden_vectors(void) {
     fclose(fp);
 }
 
+/* --tap-golden-vectors: hidden-state tap regression (HIDDEN_EXPORT.md).
+ *
+ * Two properties on the standard Metal path:
+ *  1. Zero drift: a tapped session must produce byte-identical logits and
+ *     greedy tokens as an untapped session on the same prefix; the taps are
+ *     a pure observer of the eval.
+ *  2. Golden tap values: the per-layer tap rows after a fixed prefill, plus
+ *     the single row of one more decode step, compare bitwise against a
+ *     local fixture (env forced to the canonical configuration, same
+ *     discipline as --local-golden-vectors). A missing fixture is written
+ *     and the comparison deferred to the next run; a stale header fails
+ *     with a regenerate hint.
+ * GLM sessions are skipped: their tap format follows different semantics. */
+
+#define TEST_TAP_FRONTIER 64
+#define TEST_TAP_DECODE 8
+#define TEST_TAP_GOLDEN_MAGIC 0x44533454u /* "DS4T" */
+#define TEST_TAP_GOLDEN_VERSION 1u
+
+static void test_tap_golden_vectors(void) {
+    char *saved_prefill_chunk = test_save_env("DS4_METAL_PREFILL_CHUNK");
+    char *saved_disable_metal4 = test_save_env("DS4_METAL_DISABLE_METAL4");
+    char *saved_moe_tile_max = test_save_env("DS4_METAL_MOE_TILE_MAX");
+    test_streaming_prefill_env saved_canonical_streaming_prefill =
+        test_force_canonical_streaming_prefill();
+    setenv("DS4_METAL_PREFILL_CHUNK", "4096", 1);
+    setenv("DS4_METAL_DISABLE_METAL4", "1", 1);
+    unsetenv("DS4_METAL_MOE_TILE_MAX");
+
+    ds4_engine *engine = test_open_engine(false);
+    if (!engine) {
+        test_restore_canonical_streaming_prefill(saved_canonical_streaming_prefill);
+        test_restore_env("DS4_METAL_MOE_TILE_MAX", saved_moe_tile_max);
+        test_restore_env("DS4_METAL_DISABLE_METAL4", saved_disable_metal4);
+        test_restore_env("DS4_METAL_PREFILL_CHUNK", saved_prefill_chunk);
+        return;
+    }
+    if (ds4_engine_is_glm_dsa(engine)) {
+        fprintf(stderr, "ds4-test: tap golden vectors skipped on GLM sessions\n");
+        ds4_engine_close(engine);
+        test_restore_canonical_streaming_prefill(saved_canonical_streaming_prefill);
+        test_restore_env("DS4_METAL_MOE_TILE_MAX", saved_moe_tile_max);
+        test_restore_env("DS4_METAL_DISABLE_METAL4", saved_disable_metal4);
+        test_restore_env("DS4_METAL_PREFILL_CHUNK", saved_prefill_chunk);
+        return;
+    }
+
+    const int n_layers = ds4_engine_layer_count(engine);
+    const int vocab = ds4_engine_vocab_size(engine);
+    const size_t row_values = (size_t)ds4_engine_hidden_f32_values(engine);
+    TEST_ASSERT(n_layers >= 3);
+    TEST_ASSERT(vocab > 0);
+    TEST_ASSERT(row_values > 0);
+    int tap_layers[3] = { 0, n_layers / 2, n_layers - 1 };
+
+    const char *prompt_text =
+        "The old harbor master kept a ledger of every ship that crossed the "
+        "bar, noting the tide, the wind, and the cargo in a careful hand. "
+        "When the winter storms closed the roads, the ledger became the only "
+        "record of who owed what to whom, and the fishermen trusted it more "
+        "than they trusted their own memories of the season.";
+    ds4_tokens prompt = {0};
+    ds4_tokenize_text(engine, prompt_text, &prompt);
+    TEST_ASSERT(prompt.len >= TEST_TAP_FRONTIER);
+    ds4_tokens prefix = {
+        .v = prompt.v,
+        .len = TEST_TAP_FRONTIER,
+        .cap = TEST_TAP_FRONTIER,
+    };
+
+    const int n_rows = TEST_TAP_FRONTIER + 1; /* prefill rows + 1 decode row */
+    float *logits_a = malloc((size_t)vocab * sizeof(logits_a[0]));
+    float *logits_b = malloc((size_t)vocab * sizeof(logits_b[0]));
+    float *tap_rows = malloc((size_t)3 * (size_t)n_rows * row_values *
+                             sizeof(tap_rows[0]));
+    ds4_session *sa = NULL;
+    ds4_session *sb = NULL;
+    TEST_ASSERT(logits_a != NULL && logits_b != NULL && tap_rows != NULL);
+    TEST_ASSERT(ds4_session_create(&sa, engine, 512) == 0);
+    TEST_ASSERT(ds4_session_create(&sb, engine, 512) == 0);
+    bool ok = logits_a && logits_b && tap_rows && sa && sb &&
+              prompt.len >= TEST_TAP_FRONTIER;
+
+    char err[160];
+    /* Session A: no taps, the reference. Session B: tapped, must not drift. */
+    if (ok) {
+        ok = ds4_session_sync(sa, &prefix, err, sizeof(err)) == 0;
+        TEST_ASSERT(ok);
+    }
+    if (ok) {
+        ok = ds4_session_set_hidden_taps(sb, tap_layers, 3,
+                                         DS4_TAP_FORMAT_RAW_HC) == 0 &&
+             ds4_session_sync(sb, &prefix, err, sizeof(err)) == 0;
+        TEST_ASSERT(ok);
+    }
+    if (ok) {
+        ok = ds4_session_copy_logits(sa, logits_a, vocab) == vocab &&
+             ds4_session_copy_logits(sb, logits_b, vocab) == vocab;
+        TEST_ASSERT(ok);
+    }
+    if (ok && memcmp(logits_a, logits_b,
+                     (size_t)vocab * sizeof(logits_a[0])) != 0) {
+        float max_abs = 0.0f;
+        for (int i = 0; i < vocab; i++) {
+            const float d = fabsf(logits_a[i] - logits_b[i]);
+            if (d > max_abs) max_abs = d;
+        }
+        fprintf(stderr,
+                "ds4-test: tap zero-drift violation, logits max_abs=%g\n",
+                max_abs);
+        TEST_ASSERT(false);
+        ok = false;
+    }
+
+    /* Prefill tap rows: one per submitted token, per tapped layer. */
+    if (ok) {
+        for (int li = 0; li < 3 && ok; li++) {
+            const int rows = ds4_session_read_tap(
+                sb, tap_layers[li],
+                tap_rows + (size_t)li * (size_t)n_rows * row_values,
+                TEST_TAP_FRONTIER);
+            if (rows != TEST_TAP_FRONTIER) {
+                fprintf(stderr,
+                        "ds4-test: tap prefill rows layer %d: expected %d, got %d\n",
+                        tap_layers[li], TEST_TAP_FRONTIER, rows);
+                TEST_ASSERT(false);
+                ok = false;
+            }
+        }
+    }
+
+    /* Greedy decode on both sessions: tokens must match step by step. */
+    int decoded = 0;
+    if (ok) {
+        uint64_t rng_a = 12345, rng_b = 12345;
+        for (int i = 0; i < TEST_TAP_DECODE; i++) {
+            const int ta = ds4_session_sample(sa, 0.0f, 0, 1.0f, 0.0f, &rng_a);
+            const int tb = ds4_session_sample(sb, 0.0f, 0, 1.0f, 0.0f, &rng_b);
+            if (ta != tb ||
+                ds4_session_eval(sa, ta, err, sizeof(err)) != 0 ||
+                ds4_session_eval(sb, tb, err, sizeof(err)) != 0) {
+                ok = false;
+                break;
+            }
+            decoded++;
+        }
+        TEST_ASSERT(ok);
+        TEST_ASSERT(decoded == TEST_TAP_DECODE);
+        ok = decoded == TEST_TAP_DECODE;
+    }
+
+    /* After the decode steps the tap holds the single row of the last eval. */
+    if (ok) {
+        for (int li = 0; li < 3 && ok; li++) {
+            const int rows = ds4_session_read_tap(
+                sb, tap_layers[li],
+                tap_rows + ((size_t)li * (size_t)n_rows + TEST_TAP_FRONTIER) *
+                    row_values,
+                1);
+            if (rows != 1) {
+                fprintf(stderr,
+                        "ds4-test: tap decode rows layer %d: expected 1, got %d\n",
+                        tap_layers[li], rows);
+                TEST_ASSERT(false);
+                ok = false;
+            }
+        }
+    }
+
+    /* Fixture: u32 header (host little-endian, like every supported target)
+     * then layer-major f32 rows via plain fwrite/fread. */
+    if (ok) {
+        const char *path = getenv("DS4_TEST_TAP_GOLDEN_FILE");
+        if (!path || !path[0]) path = "tests/test-vectors/tap-golden.bin";
+        const size_t n_floats = (size_t)3 * (size_t)n_rows * row_values;
+        FILE *fp = fopen(path, "rb");
+        if (!fp) {
+            fp = fopen(path, "wb");
+            TEST_ASSERT(fp != NULL);
+            if (fp) {
+                uint32_t hdr[6] = {
+                    TEST_TAP_GOLDEN_MAGIC, TEST_TAP_GOLDEN_VERSION,
+                    3, (uint32_t)row_values, (uint32_t)n_rows, 0,
+                };
+                fwrite(hdr, sizeof(hdr[0]), 6, fp);
+                for (int li = 0; li < 3; li++) {
+                    const uint32_t id = (uint32_t)tap_layers[li];
+                    fwrite(&id, sizeof(id), 1, fp);
+                }
+                fwrite(tap_rows, sizeof(tap_rows[0]), n_floats, fp);
+                fprintf(stderr,
+                        "ds4-test: tap golden fixture written to %s; rerun to compare\n",
+                        path);
+            }
+        } else {
+            uint32_t hdr[6] = {0};
+            uint32_t ids[3] = {0};
+            bool hdr_ok = fread(hdr, sizeof(hdr[0]), 6, fp) == 6 &&
+                          fread(ids, sizeof(ids[0]), 3, fp) == 3 &&
+                          hdr[0] == TEST_TAP_GOLDEN_MAGIC &&
+                          hdr[1] == TEST_TAP_GOLDEN_VERSION &&
+                          hdr[2] == 3 &&
+                          hdr[3] == (uint32_t)row_values &&
+                          hdr[4] == (uint32_t)n_rows;
+            for (int li = 0; li < 3 && hdr_ok; li++) {
+                hdr_ok = ids[li] == (uint32_t)tap_layers[li];
+            }
+            if (!hdr_ok) {
+                fprintf(stderr,
+                        "ds4-test: tap golden fixture %s header mismatch; "
+                        "delete it to regenerate\n", path);
+                TEST_ASSERT(false);
+            } else {
+                float *ref = malloc(n_floats * sizeof(ref[0]));
+                TEST_ASSERT(ref != NULL);
+                if (ref) {
+                    const size_t got =
+                        fread(ref, sizeof(ref[0]), n_floats, fp);
+                    TEST_ASSERT(got == n_floats);
+                    if (got == n_floats &&
+                        memcmp(ref, tap_rows,
+                               n_floats * sizeof(ref[0])) != 0) {
+                        size_t first = 0;
+                        float max_abs = 0.0f;
+                        for (size_t i = 0; i < n_floats; i++) {
+                            const float d = fabsf(ref[i] - tap_rows[i]);
+                            if (d > 0.0f && first == 0) first = i;
+                            if (d > max_abs) max_abs = d;
+                        }
+                        fprintf(stderr,
+                                "ds4-test: tap golden drift: first float #%zu "
+                                "ref=%g got=%g max_abs=%g\n",
+                                first, ref[first], tap_rows[first], max_abs);
+                        TEST_ASSERT(false);
+                    }
+                    free(ref);
+                }
+            }
+        }
+        if (fp) fclose(fp);
+    }
+
+    if (sa) ds4_session_free(sa);
+    if (sb) ds4_session_free(sb);
+    free(logits_a);
+    free(logits_b);
+    free(tap_rows);
+    ds4_tokens_free(&prompt);
+    ds4_engine_close(engine);
+    test_restore_canonical_streaming_prefill(saved_canonical_streaming_prefill);
+    test_restore_env("DS4_METAL_MOE_TILE_MAX", saved_moe_tile_max);
+    test_restore_env("DS4_METAL_DISABLE_METAL4", saved_disable_metal4);
+    test_restore_env("DS4_METAL_PREFILL_CHUNK", saved_prefill_chunk);
+}
+
 #define TEST_MPP_EQ_MAX_CASES 8
 #define TEST_MPP_EQ_TOPK 20
 #define TEST_MPP_EQ_TOP5 5
@@ -6705,6 +6960,7 @@ static const ds4_test_entry test_entries[] = {
     {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison on the standard Metal path", test_official_logprob_vectors},
     {"--metal-ssd-streaming-cache-pressure", "metal-ssd-streaming-cache-pressure", "Metal SSD-streaming layer-batched decode cache-pressure repro for issue #384", test_metal_ssd_streaming_cache_pressure},
     {"--local-golden-vectors", "local-golden-vectors", "local top-k/logit drift regression for long Metal prefill", test_local_golden_vectors},
+    {"--tap-golden-vectors", "tap-golden-vectors", "hidden-tap zero-drift and golden tap-value regression", test_tap_golden_vectors},
     {"--metal-short-prefill", "metal-short-prefill", "Metal ratio-4 short prefill regression", test_metal_short_prefill_ratio4},
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernel_group},
     {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
@@ -6741,6 +6997,7 @@ static void test_print_help(const char *prog) {
     puts("  DS4_TEST_LONG_PROMPT=FILE  Rendered long-context story fact prompt.");
     puts("  DS4_TEST_VECTOR_FILE=FILE  Simple official-vector fixture.");
     puts("  DS4_TEST_LOCAL_GOLDEN_FILE=FILE  Local top-k golden-vector fixture.");
+    puts("  DS4_TEST_TAP_GOLDEN_FILE=FILE  Hidden-tap golden fixture (default tests/test-vectors/tap-golden.bin).");
     puts("  DS4_TEST_MPP_EQ_CASE=NAME  Run only Tensor equivalence cases whose id contains NAME.");
     puts("  DS4_TEST_MTP=FILE         Legacy MTP support GGUF for --mtp-verify-depth.");
     puts("  DS4_TEST_DSPARK=FILE      DSpark support GGUF for --dspark-verify-depth.");
