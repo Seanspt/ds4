@@ -365,7 +365,7 @@ static void print_kv_cache(FILE *fp, const help_colors *c) {
 static void print_hidden_export(FILE *fp, const help_colors *c, ds4_help_tool tool) {
     title(fp, c, "Hidden-State Export");
     opt(fp, c, "--hidden-export-listen HOST PORT", "Stream tapped hidden states to one TCP subscriber.");
-    opt(fp, c, "--hidden-export-layers CSV", "Tapped layers, e.g. 40,41,42 (max 8). Required with export.");
+    opt(fp, c, "--hidden-export-layers CSV", "Tapped layers, e.g. 40,41,42 (max 8). Required with export. Sentinel tap layers (embed/final-norm) are session-local only and rejected here.");
     opt(fp, c, "--hidden-export-format f32|f16", "Wire payload width. Default: f32");
     opt(fp, c, "--role train-sink --hidden-source HOST PORT --dump FILE",
         "Model-free consumer: verify and dump a publisher's stream (see HIDDEN_EXPORT.md).");
@@ -373,6 +373,19 @@ static void print_hidden_export(FILE *fp, const help_colors *c, ds4_help_tool to
     para(fp, c, "Not combinable with speculative decoding or (ds4-server) --batched-session.");
     if (tool == DS4_HELP_DS4)
         para(fp, c, "Wired to the interactive REPL only, not -p/--prompt-file one-shot generation.");
+    fputc('\n', fp);
+}
+
+static void print_cache_gen(FILE *fp, const help_colors *c) {
+    title(fp, c, "DeepSpec Target-Cache Generation (--role cache-gen)");
+    opt(fp, c, "--dataset FILE", "JSONL, one {\"messages\":[...]} per line; exactly one assistant turn, last.");
+    opt(fp, c, "--cache-out DIR", "Output cache dir (must be new or empty). manifest.json/samples.idx/shard-*.bin.");
+    opt(fp, c, "--tap-layers CSV", "Hidden tap layers, ascending, e.g. 1,11,21,31,41; -1 = embedding. FINAL_NORM is always added.");
+    opt(fp, c, "--target-name NAME", "manifest target_model_name_or_path (must match the DeepSpec training config).");
+    opt(fp, c, "--max-length N", "Truncate rendered conversations. Default: 4096");
+    opt(fp, c, "--min-loss-tokens N", "Drop samples with fewer loss tokens after truncation. Default: 14");
+    opt(fp, c, "--max-shard-bytes N", "Shard rotation limit. Default: 64 GiB");
+    para(fp, c, "Offline DeepSpec target-cache v2 producer: teacher-forced prefill with hidden taps, no generation. See DEEPSPEC_INTEGRATION.md.");
     fputc('\n', fp);
 }
 
@@ -421,7 +434,7 @@ static bool tool_has_topic(ds4_help_tool tool, const char *topic) {
     switch (tool) {
     case DS4_HELP_DS4:
         return streq(topic, "diagnostics") || streq(topic, "commands") ||
-               streq(topic, "hidden-export");
+               streq(topic, "hidden-export") || streq(topic, "cache-gen");
     case DS4_HELP_SERVER:
         return streq(topic, "api") || streq(topic, "kv-cache") ||
                streq(topic, "thinking") || streq(topic, "hidden-export");
@@ -459,6 +472,7 @@ static void print_more_info(FILE *fp, const help_colors *c, ds4_help_tool tool) 
         more_line(fp, c, "Interactive commands:", "commands");
         more_line(fp, c, "Diagnostics:", "diagnostics");
         more_line(fp, c, "Hidden-state export:", "hidden-export");
+        more_line(fp, c, "DeepSpec cache generation:", "cache-gen");
     } else if (tool == DS4_HELP_SERVER) {
         more_line(fp, c, "HTTP API:", "api");
         more_line(fp, c, "Disk KV cache:", "kv-cache");
@@ -530,6 +544,7 @@ static void print_topic(FILE *fp, const help_colors *c, ds4_help_tool tool, cons
             print_cli_specific(fp, c, true);
             print_cli_commands(fp, c);
             print_hidden_export(fp, c, tool);
+            print_cache_gen(fp, c);
         } else if (tool == DS4_HELP_SERVER) {
             print_server_api(fp, c);
             print_server_thinking(fp, c);
@@ -553,6 +568,7 @@ static void print_topic(FILE *fp, const help_colors *c, ds4_help_tool tool, cons
     else if (tool == DS4_HELP_DS4 && streq(topic, "diagnostics")) print_cli_diagnostics(fp, c);
     else if (tool == DS4_HELP_DS4 && streq(topic, "commands")) print_cli_commands(fp, c);
     else if (tool == DS4_HELP_DS4 && streq(topic, "hidden-export")) print_hidden_export(fp, c, tool);
+    else if (tool == DS4_HELP_DS4 && streq(topic, "cache-gen")) print_cache_gen(fp, c);
     else if (tool == DS4_HELP_SERVER && streq(topic, "api")) print_server_api(fp, c);
     else if (tool == DS4_HELP_SERVER && streq(topic, "kv-cache")) print_kv_cache(fp, c);
     else if (tool == DS4_HELP_SERVER && streq(topic, "thinking")) print_server_thinking(fp, c);

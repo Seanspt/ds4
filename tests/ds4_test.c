@@ -5656,22 +5656,37 @@ static void test_local_golden_vectors(void) {
 
 /* --tap-golden-vectors: hidden-state tap regression (HIDDEN_EXPORT.md).
  *
- * Two properties on the standard Metal path:
+ * Properties on the standard Metal path:
  *  1. Zero drift: a tapped session must produce byte-identical logits and
  *     greedy tokens as an untapped session on the same prefix; the taps are
  *     a pure observer of the eval.
- *  2. Golden tap values: the per-layer tap rows after a fixed prefill, plus
+ *  2. Head consistency: the tapped RAW_HC row of the last layer, fed back
+ *     through the session output head, reproduces the session logits bitwise
+ *     at the prefill frontier (same head path, byte-identical input) and
+ *     loosely across a different prefill batch size (same argmax, max_abs
+ *     <= 4.0: kernel tiling and accumulation order differ with the batch
+ *     length, measured 1.27 on M4 Max, see the assert comment).
+ *  3. Golden tap values: the per-layer tap rows after a fixed prefill, plus
  *     the single row of one more decode step, compare bitwise against a
  *     local fixture (env forced to the canonical configuration, same
  *     discipline as --local-golden-vectors). A missing fixture is written
  *     and the comparison deferred to the next run; a stale header fails
  *     with a regenerate hint.
- * GLM sessions are skipped: their tap format follows different semantics. */
+ * The tap set includes the EMBED/FINAL_NORM sentinel layers (mixed row
+ * widths: sentinels are always n_embd wide). GLM sessions are skipped:
+ * their tap format follows different semantics. */
 
 #define TEST_TAP_FRONTIER 64
 #define TEST_TAP_DECODE 8
+#define TEST_TAP_SLOTS 5
 #define TEST_TAP_GOLDEN_MAGIC 0x44533454u /* "DS4T" */
-#define TEST_TAP_GOLDEN_VERSION 1u
+#define TEST_TAP_GOLDEN_VERSION 2u
+
+/* Row width of one tap slot, mirroring ds4_session_read_tap. */
+static size_t test_tap_slot_row_values(ds4_engine *engine, int layer_id,
+                                       size_t hc_row_values) {
+    return layer_id < 0 ? (size_t)ds4_engine_embd_dim(engine) : hc_row_values;
+}
 
 static void test_tap_golden_vectors(void) {
     char *saved_prefill_chunk = test_save_env("DS4_METAL_PREFILL_CHUNK");
@@ -5707,7 +5722,22 @@ static void test_tap_golden_vectors(void) {
     TEST_ASSERT(n_layers >= 3);
     TEST_ASSERT(vocab > 0);
     TEST_ASSERT(row_values > 0);
-    int tap_layers[3] = { 0, n_layers / 2, n_layers - 1 };
+    const int tap_layers[TEST_TAP_SLOTS] = {
+        DS4_TAP_LAYER_EMBED, 0, n_layers / 2, n_layers - 1,
+        DS4_TAP_LAYER_FINAL_NORM,
+    };
+    /* Per-slot row widths (sentinels are n_embd wide) and float offsets of
+     * each slot inside the packed tap_rows buffer. */
+    size_t slot_width[TEST_TAP_SLOTS] = {0};
+    size_t slot_off[TEST_TAP_SLOTS] = {0};
+    const int n_rows = TEST_TAP_FRONTIER + 1; /* prefill rows + 1 decode row */
+    size_t total_floats = 0;
+    for (int li = 0; li < TEST_TAP_SLOTS; li++) {
+        slot_width[li] = test_tap_slot_row_values(engine, tap_layers[li],
+                                                  row_values);
+        slot_off[li] = total_floats;
+        total_floats += (size_t)n_rows * slot_width[li];
+    }
 
     const char *prompt_text =
         "The old harbor master kept a ledger of every ship that crossed the "
@@ -5724,17 +5754,17 @@ static void test_tap_golden_vectors(void) {
         .cap = TEST_TAP_FRONTIER,
     };
 
-    const int n_rows = TEST_TAP_FRONTIER + 1; /* prefill rows + 1 decode row */
     float *logits_a = malloc((size_t)vocab * sizeof(logits_a[0]));
     float *logits_b = malloc((size_t)vocab * sizeof(logits_b[0]));
-    float *tap_rows = malloc((size_t)3 * (size_t)n_rows * row_values *
-                             sizeof(tap_rows[0]));
+    float *logits_hc = malloc((size_t)vocab * sizeof(logits_hc[0]));
+    float *tap_rows = malloc(total_floats * sizeof(tap_rows[0]));
     ds4_session *sa = NULL;
     ds4_session *sb = NULL;
-    TEST_ASSERT(logits_a != NULL && logits_b != NULL && tap_rows != NULL);
+    TEST_ASSERT(logits_a != NULL && logits_b != NULL && logits_hc != NULL &&
+                tap_rows != NULL);
     TEST_ASSERT(ds4_session_create(&sa, engine, 512) == 0);
     TEST_ASSERT(ds4_session_create(&sb, engine, 512) == 0);
-    bool ok = logits_a && logits_b && tap_rows && sa && sb &&
+    bool ok = logits_a && logits_b && logits_hc && tap_rows && sa && sb &&
               prompt.len >= TEST_TAP_FRONTIER;
 
     char err[160];
@@ -5744,7 +5774,7 @@ static void test_tap_golden_vectors(void) {
         TEST_ASSERT(ok);
     }
     if (ok) {
-        ok = ds4_session_set_hidden_taps(sb, tap_layers, 3,
+        ok = ds4_session_set_hidden_taps(sb, tap_layers, TEST_TAP_SLOTS,
                                          DS4_TAP_FORMAT_RAW_HC) == 0 &&
              ds4_session_sync(sb, &prefix, err, sizeof(err)) == 0;
         TEST_ASSERT(ok);
@@ -5768,12 +5798,13 @@ static void test_tap_golden_vectors(void) {
         ok = false;
     }
 
-    /* Prefill tap rows: one per submitted token, per tapped layer. */
+    /* Prefill tap rows: one per submitted token, per tapped layer (sentinel
+     * layers included, each with its own row width). */
     if (ok) {
-        for (int li = 0; li < 3 && ok; li++) {
+        for (int li = 0; li < TEST_TAP_SLOTS && ok; li++) {
             const int rows = ds4_session_read_tap(
                 sb, tap_layers[li],
-                tap_rows + (size_t)li * (size_t)n_rows * row_values,
+                tap_rows + slot_off[li],
                 TEST_TAP_FRONTIER);
             if (rows != TEST_TAP_FRONTIER) {
                 fprintf(stderr,
@@ -5783,6 +5814,90 @@ static void test_tap_golden_vectors(void) {
                 ok = false;
             }
         }
+    }
+
+    /* Head consistency at the prefill frontier: feeding the tapped RAW_HC
+     * row of the last layer (position TEST_TAP_FRONTIER-1) back through the
+     * session output head must reproduce B's logits bitwise. Both run the
+     * same single-row head on a byte-identical input, so there is no
+     * tolerance here. Must run before the decode loop rewrites the logits. */
+    if (ok) {
+        const float *row_last =
+            tap_rows + slot_off[TEST_TAP_SLOTS - 2] +
+            (size_t)(TEST_TAP_FRONTIER - 1) * row_values;
+        ok = ds4_session_eval_output_head_from_hc(sb, row_last, 1, logits_hc,
+                                                  err, sizeof(err)) == 0;
+        TEST_ASSERT(ok);
+        if (ok && memcmp(logits_hc, logits_b,
+                         (size_t)vocab * sizeof(logits_hc[0])) != 0) {
+            float max_abs = 0.0f;
+            for (int i = 0; i < vocab; i++) {
+                const float d = fabsf(logits_hc[i] - logits_b[i]);
+                if (d > max_abs) max_abs = d;
+            }
+            fprintf(stderr,
+                    "ds4-test: tap head-consistency violation (same batch), "
+                    "logits max_abs=%g\n", max_abs);
+            TEST_ASSERT(false);
+            ok = false;
+        }
+    }
+
+    /* Same check across batch sizes: session C prefills only the first 33
+     * tokens, so position 32 is its frontier. Kernel tiling and accumulation
+     * order differ with the batch length, so compare loosely: same argmax,
+     * bounded max_abs (bound justified at the assert below). */
+    if (ok) {
+        ds4_session *sc = NULL;
+        ds4_tokens prefix33 = {
+            .v = prompt.v,
+            .len = TEST_TAP_FRONTIER / 2 + 1,
+            .cap = TEST_TAP_FRONTIER / 2 + 1,
+        };
+        float *logits_c = malloc((size_t)vocab * sizeof(logits_c[0]));
+        ok = logits_c != NULL && ds4_session_create(&sc, engine, 512) == 0;
+        TEST_ASSERT(ok);
+        if (ok) {
+            ok = ds4_session_sync(sc, &prefix33, err, sizeof(err)) == 0 &&
+                 ds4_session_copy_logits(sc, logits_c, vocab) == vocab;
+            TEST_ASSERT(ok);
+        }
+        if (ok) {
+            const float *row32 =
+                tap_rows + slot_off[TEST_TAP_SLOTS - 2] +
+                (size_t)(TEST_TAP_FRONTIER / 2) * row_values;
+            ok = ds4_session_eval_output_head_from_hc(sb, row32, 1, logits_hc,
+                                                      err, sizeof(err)) == 0;
+            TEST_ASSERT(ok);
+        }
+        if (ok) {
+            int argmax_c = 0, argmax_hc = 0;
+            float max_abs = 0.0f;
+            for (int i = 0; i < vocab; i++) {
+                if (logits_c[i] > logits_c[argmax_c]) argmax_c = i;
+                if (logits_hc[i] > logits_hc[argmax_hc]) argmax_hc = i;
+                const float d = fabsf(logits_c[i] - logits_hc[i]);
+                if (d > max_abs) max_abs = d;
+            }
+            fprintf(stderr,
+                    "ds4-test: tap head-consistency (cross batch) "
+                    "max_abs=%g argmax %s\n",
+                    max_abs,
+                    argmax_c == argmax_hc ? "match" : "MISMATCH");
+            /* Measured on M4 Max / Metal: max_abs=1.27 here, and 2.0 for the
+             * equivalent production scenario (incremental prefill 33->64 vs
+             * one-shot 64, argmax match) — batch segmentation changes kernel
+             * tiling and accumulation order, and the difference amplifies
+             * over 61 layers. The hard gates are therefore the argmax match
+             * plus a loose max_abs bound that still catches gross bugs
+             * (masking leaks, wrong rows), like the local-golden 8.0 bound. */
+            if (argmax_c != argmax_hc || max_abs > 4.0f) {
+                TEST_ASSERT(false);
+                ok = false;
+            }
+        }
+        if (sc) ds4_session_free(sc);
+        free(logits_c);
     }
 
     /* Greedy decode on both sessions: tokens must match step by step. */
@@ -5807,11 +5922,11 @@ static void test_tap_golden_vectors(void) {
 
     /* After the decode steps the tap holds the single row of the last eval. */
     if (ok) {
-        for (int li = 0; li < 3 && ok; li++) {
+        for (int li = 0; li < TEST_TAP_SLOTS && ok; li++) {
             const int rows = ds4_session_read_tap(
                 sb, tap_layers[li],
-                tap_rows + ((size_t)li * (size_t)n_rows + TEST_TAP_FRONTIER) *
-                    row_values,
+                tap_rows + slot_off[li] +
+                    (size_t)TEST_TAP_FRONTIER * slot_width[li],
                 1);
             if (rows != 1) {
                 fprintf(stderr,
@@ -5823,43 +5938,48 @@ static void test_tap_golden_vectors(void) {
         }
     }
 
-    /* Fixture: u32 header (host little-endian, like every supported target)
-     * then layer-major f32 rows via plain fwrite/fread. */
+    /* Fixture v2 (host little-endian, like every supported target): u32
+     * magic/version/n_slots/n_rows, then per slot (i32 layer id, u32 row
+     * width), then slot-major f32 rows via plain fwrite/fread. v2 carries
+     * negative sentinel layer ids and mixed row widths. */
     if (ok) {
         const char *path = getenv("DS4_TEST_TAP_GOLDEN_FILE");
         if (!path || !path[0]) path = "tests/test-vectors/tap-golden.bin";
-        const size_t n_floats = (size_t)3 * (size_t)n_rows * row_values;
         FILE *fp = fopen(path, "rb");
         if (!fp) {
             fp = fopen(path, "wb");
             TEST_ASSERT(fp != NULL);
             if (fp) {
-                uint32_t hdr[6] = {
+                const uint32_t hdr[4] = {
                     TEST_TAP_GOLDEN_MAGIC, TEST_TAP_GOLDEN_VERSION,
-                    3, (uint32_t)row_values, (uint32_t)n_rows, 0,
+                    TEST_TAP_SLOTS, (uint32_t)n_rows,
                 };
-                fwrite(hdr, sizeof(hdr[0]), 6, fp);
-                for (int li = 0; li < 3; li++) {
-                    const uint32_t id = (uint32_t)tap_layers[li];
+                fwrite(hdr, sizeof(hdr[0]), 4, fp);
+                for (int li = 0; li < TEST_TAP_SLOTS; li++) {
+                    const int32_t id = (int32_t)tap_layers[li];
+                    const uint32_t width = (uint32_t)slot_width[li];
                     fwrite(&id, sizeof(id), 1, fp);
+                    fwrite(&width, sizeof(width), 1, fp);
                 }
-                fwrite(tap_rows, sizeof(tap_rows[0]), n_floats, fp);
+                fwrite(tap_rows, sizeof(tap_rows[0]), total_floats, fp);
                 fprintf(stderr,
                         "ds4-test: tap golden fixture written to %s; rerun to compare\n",
                         path);
             }
         } else {
-            uint32_t hdr[6] = {0};
-            uint32_t ids[3] = {0};
-            bool hdr_ok = fread(hdr, sizeof(hdr[0]), 6, fp) == 6 &&
-                          fread(ids, sizeof(ids[0]), 3, fp) == 3 &&
+            uint32_t hdr[4] = {0};
+            int32_t ids[TEST_TAP_SLOTS] = {0};
+            uint32_t widths[TEST_TAP_SLOTS] = {0};
+            bool hdr_ok = fread(hdr, sizeof(hdr[0]), 4, fp) == 4 &&
                           hdr[0] == TEST_TAP_GOLDEN_MAGIC &&
                           hdr[1] == TEST_TAP_GOLDEN_VERSION &&
-                          hdr[2] == 3 &&
-                          hdr[3] == (uint32_t)row_values &&
-                          hdr[4] == (uint32_t)n_rows;
-            for (int li = 0; li < 3 && hdr_ok; li++) {
-                hdr_ok = ids[li] == (uint32_t)tap_layers[li];
+                          hdr[2] == TEST_TAP_SLOTS &&
+                          hdr[3] == (uint32_t)n_rows;
+            for (int li = 0; li < TEST_TAP_SLOTS && hdr_ok; li++) {
+                hdr_ok = fread(&ids[li], sizeof(ids[0]), 1, fp) == 1 &&
+                         fread(&widths[li], sizeof(widths[0]), 1, fp) == 1 &&
+                         ids[li] == (int32_t)tap_layers[li] &&
+                         widths[li] == (uint32_t)slot_width[li];
             }
             if (!hdr_ok) {
                 fprintf(stderr,
@@ -5867,18 +5987,18 @@ static void test_tap_golden_vectors(void) {
                         "delete it to regenerate\n", path);
                 TEST_ASSERT(false);
             } else {
-                float *ref = malloc(n_floats * sizeof(ref[0]));
+                float *ref = malloc(total_floats * sizeof(ref[0]));
                 TEST_ASSERT(ref != NULL);
                 if (ref) {
                     const size_t got =
-                        fread(ref, sizeof(ref[0]), n_floats, fp);
-                    TEST_ASSERT(got == n_floats);
-                    if (got == n_floats &&
+                        fread(ref, sizeof(ref[0]), total_floats, fp);
+                    TEST_ASSERT(got == total_floats);
+                    if (got == total_floats &&
                         memcmp(ref, tap_rows,
-                               n_floats * sizeof(ref[0])) != 0) {
+                               total_floats * sizeof(ref[0])) != 0) {
                         size_t first = 0;
                         float max_abs = 0.0f;
-                        for (size_t i = 0; i < n_floats; i++) {
+                        for (size_t i = 0; i < total_floats; i++) {
                             const float d = fabsf(ref[i] - tap_rows[i]);
                             if (d > 0.0f && first == 0) first = i;
                             if (d > max_abs) max_abs = d;
@@ -5900,6 +6020,7 @@ static void test_tap_golden_vectors(void) {
     if (sb) ds4_session_free(sb);
     free(logits_a);
     free(logits_b);
+    free(logits_hc);
     free(tap_rows);
     ds4_tokens_free(&prompt);
     ds4_engine_close(engine);

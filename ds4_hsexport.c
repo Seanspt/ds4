@@ -714,6 +714,16 @@ int ds4_hsexport_attach(ds4_hsexport *x,
         if (errlen) snprintf(err, errlen, "invalid hidden export attach arguments");
         return 1;
     }
+    /* The wire format carries one uniform row width per batch, so the
+     * n_embd-wide sentinel tap layers cannot be exported yet; keep them
+     * session-local (HIDDEN_EXPORT.md). */
+    for (int i = 0; i < n_layers; i++) {
+        if (layers[i] < 0) {
+            if (errlen) snprintf(err, errlen,
+                                 "hidden export does not carry sentinel tap layers (embed/final-norm) on the wire yet");
+            return 1;
+        }
+    }
     /* The engine validates layer ids, duplicates, and rejects GLM/TP/
      * distributed-coordinator sessions. */
     if (ds4_session_set_hidden_taps(session, layers, n_layers,

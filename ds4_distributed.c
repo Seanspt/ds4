@@ -571,6 +571,7 @@ static const char *dist_role_name(ds4_distributed_role role) {
     case DS4_DISTRIBUTED_COORDINATOR: return "coordinator";
     case DS4_DISTRIBUTED_WORKER:      return "worker";
     case DS4_DISTRIBUTED_TRAIN_SINK:  return "train-sink";
+    case DS4_DISTRIBUTED_CACHE_GEN:   return "cache-gen";
     }
     return "unknown";
 }
@@ -8405,6 +8406,10 @@ static bool dist_parse_role(const char *s, ds4_distributed_role *out) {
         *out = DS4_DISTRIBUTED_TRAIN_SINK;
         return true;
     }
+    if (!strcmp(s, "cache-gen")) {
+        *out = DS4_DISTRIBUTED_CACHE_GEN;
+        return true;
+    }
     return false;
 }
 
@@ -8546,7 +8551,7 @@ ds4_dist_cli_parse_result ds4_dist_parse_cli_arg(
         if (!role) return DS4_DIST_CLI_ERROR;
         if (!opt || !dist_parse_role(role, &opt->role)) {
             if (errlen) snprintf(err, errlen,
-                                 "invalid distributed role: %s (valid roles: none, coordinator, worker, train-sink)",
+                                 "invalid distributed role: %s (valid roles: none, coordinator, worker, train-sink, cache-gen)",
                                  role);
             return DS4_DIST_CLI_ERROR;
         }
@@ -8675,7 +8680,8 @@ static int dist_validate_options(const ds4_dist_options *opt, char *err, size_t 
     }
 
     if (opt->role == DS4_DISTRIBUTED_NONE ||
-        opt->role == DS4_DISTRIBUTED_TRAIN_SINK) {
+        opt->role == DS4_DISTRIBUTED_TRAIN_SINK ||
+        opt->role == DS4_DISTRIBUTED_CACHE_GEN) {
         if (opt->layers.set || opt->listen_host || opt->listen_port ||
             opt->coordinator_host || opt->coordinator_port ||
             opt->prefill_chunk != 0 || opt->prefill_window != 0 ||

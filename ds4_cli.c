@@ -1,4 +1,5 @@
 #include "ds4.h"
+#include "ds4_cachegen.h"
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
 #include "ds4_tp.h"
@@ -112,6 +113,14 @@ typedef struct {
     const char *hidden_source_host;
     int hidden_source_port;
     const char *hidden_dump_path;
+    /* cache-gen role (DEEPSPEC_INTEGRATION.md Stage B). */
+    const char *cg_dataset;
+    const char *cg_out;
+    const char *cg_tap_layers;
+    const char *cg_target_name;
+    int cg_max_length;
+    int cg_min_loss_tokens;
+    uint64_t cg_max_shard_bytes;
 } cli_config;
 
 static volatile sig_atomic_t cli_interrupted;
@@ -1180,6 +1189,43 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
     return 0;
 }
 
+/* `--role cache-gen`: offline DeepSpec target-cache producer
+ * (DEEPSPEC_INTEGRATION.md Stage B). Interruptible via SIGINT/SIGTERM;
+ * exit code 130 on interrupt (conventional 128+SIGINT). */
+static bool cli_cachegen_cancel(void *ud) {
+    (void)ud;
+    return cli_interrupt_requested();
+}
+
+static int run_cache_gen(ds4_engine *engine, const cli_config *cfg) {
+    struct sigaction old_int, old_term, sa;
+    memset(&sa, 0, sizeof(sa));
+    sigemptyset(&sa.sa_mask);
+    sa.sa_handler = cli_sigint_handler;
+    const bool int_installed = sigaction(SIGINT, &sa, &old_int) == 0;
+    const bool term_installed = sigaction(SIGTERM, &sa, &old_term) == 0;
+    cli_interrupt_clear();
+
+    const ds4_cachegen_options cg = {
+        .dataset_path = cfg->cg_dataset,
+        .out_dir = cfg->cg_out,
+        .tap_layers_csv = cfg->cg_tap_layers,
+        .target_name = cfg->cg_target_name,
+        .max_length = cfg->cg_max_length,
+        .min_loss_tokens = cfg->cg_min_loss_tokens,
+        .max_shard_bytes = cfg->cg_max_shard_bytes,
+        .git_sha = NULL, /* ds4_cachegen.c fills its build-time DS4_GIT_SHA */
+        .cancel = cli_cachegen_cancel,
+        .cancel_ud = NULL,
+    };
+    char err[512];
+    int rc = ds4_cachegen_run(engine, &cg, err, sizeof(err));
+    if (rc == 1) fprintf(stderr, "ds4: %s\n", err);
+    if (int_installed) sigaction(SIGINT, &old_int, NULL);
+    if (term_installed) sigaction(SIGTERM, &old_term, NULL);
+    return rc == 2 ? 130 : rc;
+}
+
 static int run_generation(ds4_engine *engine, const cli_config *cfg) {
     ds4_tokens prompt = {0};
     build_prompt(engine, &cfg->gen, &prompt);
@@ -2107,6 +2153,28 @@ static cli_config parse_options(int argc, char **argv) {
             c.hidden_source_port = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--dump")) {
             c.hidden_dump_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dataset")) {
+            c.cg_dataset = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--cache-out")) {
+            c.cg_out = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--tap-layers")) {
+            c.cg_tap_layers = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--target-name")) {
+            c.cg_target_name = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--max-length")) {
+            c.cg_max_length = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--min-loss-tokens")) {
+            c.cg_min_loss_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--max-shard-bytes")) {
+            const char *v = need_arg(&i, argc, argv, arg);
+            errno = 0;
+            char *end = NULL;
+            const unsigned long long n = strtoull(v, &end, 10);
+            if (errno || end == v || *end != '\0' || n == 0) {
+                fprintf(stderr, "ds4: --max-shard-bytes requires a positive byte count\n");
+                exit(2);
+            }
+            c.cg_max_shard_bytes = (uint64_t)n;
         } else if (!strcmp(arg, "--server")) {
             fprintf(stderr, "ds4: use ds4-server for the HTTP server\n");
             exit(2);
@@ -2199,6 +2267,46 @@ static cli_config parse_options(int argc, char **argv) {
         fprintf(stderr, "ds4: --hidden-source/--dump require --role train-sink\n");
         exit(2);
     }
+    if (c.engine.distributed.role == DS4_DISTRIBUTED_CACHE_GEN) {
+        /* Offline DeepSpec target-cache producer (DEEPSPEC_INTEGRATION.md
+         * Stage B): loads the model, teacher-forced prefill only. */
+        if (!c.cg_dataset || !c.cg_out || !c.cg_tap_layers || !c.cg_target_name) {
+            fprintf(stderr,
+                    "ds4: --role cache-gen requires --dataset FILE --cache-out DIR --tap-layers CSV --target-name NAME\n");
+            exit(2);
+        }
+        if (c.cg_max_length < 0 || c.cg_min_loss_tokens < 0) {
+            fprintf(stderr,
+                    "ds4: --max-length/--min-loss-tokens must be non-negative\n");
+            exit(2);
+        }
+        const int eff_ml = c.cg_max_length > 0 ?
+            c.cg_max_length : DS4_CACHEGEN_DEFAULT_MAX_LENGTH;
+        if (c.gen.ctx_size > 0 && c.gen.ctx_size < eff_ml) {
+            fprintf(stderr,
+                    "ds4: --role cache-gen needs --ctx-size >= --max-length (%d)\n",
+                    eff_ml);
+            exit(2);
+        }
+        if (c.hidden_export_host || c.hidden_export_layers || c.hidden_export_format) {
+            fprintf(stderr, "ds4: --role cache-gen does not take --hidden-export-* options\n");
+            exit(2);
+        }
+        if (c.gen.prompt) {
+            fprintf(stderr, "ds4: --role cache-gen does not use -p/--prompt-file\n");
+            exit(2);
+        }
+        if (c.engine.mtp_path || c.engine.dspark || c.engine.glm_mtp) {
+            fprintf(stderr,
+                    "ds4: --role cache-gen does not use speculative decoding (--mtp/--dspark/--glm-mtp)\n");
+            exit(2);
+        }
+    } else if (c.cg_dataset || c.cg_out || c.cg_tap_layers || c.cg_target_name ||
+               c.cg_max_length || c.cg_min_loss_tokens || c.cg_max_shard_bytes) {
+        fprintf(stderr,
+                "ds4: --dataset/--cache-out/--tap-layers/--target-name/--max-length/--min-loss-tokens/--max-shard-bytes require --role cache-gen\n");
+        exit(2);
+    }
 
     return c;
 }
@@ -2246,6 +2354,14 @@ int main(int argc, char **argv) {
     cfg.engine.first_token_test = cfg.gen.first_token_test;
     cfg.engine.metal_graph_test = cfg.gen.metal_graph_test;
     cfg.engine.context_size = cfg.gen.ctx_size;
+    if (cfg.engine.distributed.role == DS4_DISTRIBUTED_CACHE_GEN &&
+        cfg.engine.context_size <= 0) {
+        /* cache-gen prefills up to --max-length per sample; default the
+         * context to that instead of the (larger) engine default. */
+        cfg.engine.context_size = cfg.cg_max_length > 0 ?
+            cfg.cg_max_length : DS4_CACHEGEN_DEFAULT_MAX_LENGTH;
+        cfg.gen.ctx_size = cfg.engine.context_size;
+    }
     cfg.engine.placement_ctx_hint = cfg.gen.ctx_size;
     ds4_engine *engine = NULL;
     if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
@@ -2363,6 +2479,8 @@ int main(int argc, char **argv) {
                                         cfg.gen.imatrix_max_tokens);
     } else if (cfg.gen.perplexity_file_path) {
         rc = run_perplexity_file(engine, &cfg);
+    } else if (cfg.engine.distributed.role == DS4_DISTRIBUTED_CACHE_GEN) {
+        rc = run_cache_gen(engine, &cfg);
     } else if (cfg.gen.prompt == NULL) {
         if (cfg.hidden_export_host) {
             cfg.export_n_layers =

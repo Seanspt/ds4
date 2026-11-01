@@ -71,6 +71,10 @@ typedef enum {
     /* `./ds4 --role train-sink`: pure hidden-export consumer (HIDDEN_EXPORT.md
      * 3.4); loads no model and runs no pipeline. */
     DS4_DISTRIBUTED_TRAIN_SINK,
+    /* `./ds4 --role cache-gen`: offline DeepSpec target-cache producer
+     * (DEEPSPEC_INTEGRATION.md Stage B, ds4_cachegen.c); loads the model
+     * locally, runs no distributed pipeline. */
+    DS4_DISTRIBUTED_CACHE_GEN,
 } ds4_distributed_role;
 
 typedef struct {
@@ -243,11 +247,32 @@ int ds4_engine_embd_dim(ds4_engine *e);
 #define DS4_TAP_FORMAT_RAW_HC  0   /* hc_dim f32 per row (n_embd for GLM) */
 #define DS4_TAP_FORMAT_MEAN_HC 1   /* n_embd f32 per row */
 
-/* Replace the session's tap set. n_layers == 0 disables tapping. Returns 0 on
+/* Sentinel tap layer ids (DEEPSPEC_INTEGRATION.md 3.2; -1 mirrors DeepSpec's
+ * embedding convention). Both capture n_embd-wide rows
+ * (ds4_engine_embd_dim) regardless of the session's tap format:
+ *   DS4_TAP_LAYER_EMBED      the eval's initial hidden state, mean over the
+ *                            HC streams; for token input this equals the
+ *                            plain embedding row (hc_from_plain_embedding
+ *                            copies one vector into every stream).
+ *   DS4_TAP_LAYER_FINAL_NORM the output_norm row: post final RMSNorm, pre
+ *                            lm head. Captured with the same kernel sequence
+ *                            as the output head, so a row is bitwise the
+ *                            lm-head input of that position (prefill rows
+ *                            use the batched output-head kernels, matching
+ *                            the speculative-verify head).
+ * Sentinels are not wired to the hidden-export TCP channel; they are
+ * session-local taps only. */
+#define DS4_TAP_LAYER_FINAL_NORM (-2)
+#define DS4_TAP_LAYER_EMBED      (-1)
+
+/* Replace the session's tap set. n_layers == 0 disables tapping. Layer ids
+ * are [0, n_layer) or the DS4_TAP_LAYER_* sentinels. Returns 0 on
  * success, <0 on invalid layers/format or an unsupported session. */
 int ds4_session_set_hidden_taps(ds4_session *s, const int *layers,
                                 int n_layers, int format);
 /* Copy the rows captured by the most recent eval for one tapped layer.
+ * The row width is ds4_engine_embd_dim for sentinel layers, otherwise
+ * n_embd (MEAN_HC) or ds4_engine_hidden_f32_values (RAW_HC).
  * Returns the row count, or <0 on error (unknown layer, buffer too small). */
 int ds4_session_read_tap(const ds4_session *s, int layer,
                          float *out, int max_rows);

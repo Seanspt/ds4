@@ -122,6 +122,14 @@ must not depend on tensor internals.
   (`./ds4 --role train-sink --hidden-source HOST PORT --dump FILE`).
   Publisher wired into `ds4` (REPL) and `ds4-server` via
   `--hidden-export-*`.
+- `ds4_cachegen.c/.h` + `ds4_cache_writer.c/.h`: `./ds4 --role cache-gen`
+  (DEEPSPEC_INTEGRATION.md Stage B) — offline DeepSpec target-cache v2
+  producer. cachegen owns the dataset/JSONL parsing, chat rendering
+  (mirrors the ds4_server.c DeepSeek renderer), loss_mask spans, and the
+  chunked teacher-forced prefill; the writer is the self-contained
+  manifest/idx/shard module (f32->bf16 RNE, shard rotation) covered by
+  `tests/test_cache_writer.c` and `tests/validate_target_cache.py`
+  (DeepSpec's own CacheDataset as the contract oracle).
 - `ds4_help.c/.h`: `--help` rendering shared by all binaries.
 - `rax.c/.h`, `rax_malloc.h`: vendored radix tree; `linenoise.c/.h`: REPL line
   editing.
@@ -177,8 +185,9 @@ Build validation is `make`; warning-free output is a release requirement.
 ```sh
 make test        # unit/regression suite: ds4-eval extractor self-test,
                  # ds4_agent_test, ds4_test, test_layer_pack, test_hsexport,
-                 # test_engine_mgpu_placement, test_gpu_args (+CLI script),
-                 # test_sampling on Linux, q4k-dot-test
+                 # test_cache_writer, test_engine_mgpu_placement,
+                 # test_gpu_args (+CLI script), test_sampling on Linux,
+                 # q4k-dot-test
 ```
 
 `make test` needs a model (default `ds4flash.gguf`, override with
